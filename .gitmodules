@@ -1,0 +1,4 @@
+[submodule "experiments/atp-lean-gnn"]
+	path = experiments/atp-lean-gnn
+	url = https://github.com/jajos12/atp_lean_gnn
+	branch = main

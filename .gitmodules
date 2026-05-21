@@ -21,7 +21,13 @@
 	path = experiments/leandojo-pantograph-experiments
 	url = https://github.com/tsigemariamzewdu/leandojo-pantograph-experiments
 	branch = master
+
 [submodule "experiments/lean_AST_parser_essentializer"]
 	path = experiments/lean_AST_parser_essentializer
 	url = https://github.com/123nol/essentializer.git
+
+[submodule "experiments/trueagi-pln"]
+	path = experiments/trueagi-pln
+	url = https://github.com/tsigemariamzewdu/trueagi-pln-experiment.git
+
 	branch = main

@@ -1,3 +1,6 @@
+[submodule "experiments/atp-lean-gnn"]
+	path = experiments/atp-lean-gnn
+	url = https://github.com/jajos12/atp_lean_gnn
 [submodule "experiments/gnn-assisted-stv-prediction"]
 	path = experiments/gnn-assisted-stv-prediction
 	url = git@github.com:Pequanta/Mathematics.ai-atp.git
@@ -9,4 +12,22 @@
 [submodule "experiments/trello-github-automation"]
 	path = experiments/trello-github-automation
 	url = git@github.com:Pequanta/trell-github-automation.git
+	branch = main
+[submodule "experiments/pettaChainer_pln"]
+	path = experiments/pettaChainer_pln
+	url = https://github.com/123nol/petta_chainer
+	branch = main
+[submodule "experiments/leandojo-pantograph-experiments"]
+	path = experiments/leandojo-pantograph-experiments
+	url = https://github.com/tsigemariamzewdu/leandojo-pantograph-experiments
+	branch = master
+
+[submodule "experiments/lean_AST_parser_essentializer"]
+	path = experiments/lean_AST_parser_essentializer
+	url = https://github.com/123nol/essentializer.git
+
+[submodule "experiments/trueagi-pln"]
+	path = experiments/trueagi-pln
+	url = https://github.com/tsigemariamzewdu/trueagi-pln-experiment.git
+
 	branch = main

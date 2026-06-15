@@ -1,0 +1,348 @@
+{
+  "input_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/translator/input_json_test.json",
+  "output_dir": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output",
+  "runner_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/run_all_generated.sh",
+  "depth": 10,
+  "normalize_variables": false,
+  "generated_items": [
+    {
+      "test_name": "modus_ponens_after_apply",
+      "goal_index": 0,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/modus_ponens_after_apply_goal_0.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/modus_ponens_after_apply_goal_0.log",
+      "target_formula": "(P)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-b66d4908-0",
+          "formula": "(P)",
+          "atom": "(: local-hyp-b66d4908-0 (P) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-b66d4908-1",
+          "formula": "(Implication\n   (Premises (P))\n   (Conclusions (Q))\n)",
+          "atom": "(: local-hyp-b66d4908-1 (Implication\n   (Premises (P))\n   (Conclusions (Q))\n) (STV 1.0 1.0))"
+        }
+      ]
+    },
+    {
+      "test_name": "chain_implication_after_apply_hQR",
+      "goal_index": 0,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/chain_implication_after_apply_hQR_goal_0.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/chain_implication_after_apply_hQR_goal_0.log",
+      "target_formula": "(Q)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-fc658a6d-0",
+          "formula": "(P)",
+          "atom": "(: local-hyp-fc658a6d-0 (P) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-fc658a6d-1",
+          "formula": "(Implication\n   (Premises (P))\n   (Conclusions (Q))\n)",
+          "atom": "(: local-hyp-fc658a6d-1 (Implication\n   (Premises (P))\n   (Conclusions (Q))\n) (STV 1.0 1.0))"
+        },
+        {
+          "index": 2,
+          "label": "local-hyp-fc658a6d-2",
+          "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+          "atom": "(: local-hyp-fc658a6d-2 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+        }
+      ]
+    },
+    {
+      "test_name": "and_commutativity_after_constructor",
+      "goal_index": 0,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_0.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_0.log",
+      "target_formula": "(Q)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-5d45b6fa-0",
+          "formula": "(P)",
+          "atom": "(: local-hyp-5d45b6fa-0 (P) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-5d45b6fa-1",
+          "formula": "(Q)",
+          "atom": "(: local-hyp-5d45b6fa-1 (Q) (STV 1.0 1.0))"
+        }
+      ]
+    },
+    {
+      "test_name": "and_commutativity_after_constructor",
+      "goal_index": 1,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_1.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_1.log",
+      "target_formula": "(P)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-0d57673b-0",
+          "formula": "(P)",
+          "atom": "(: local-hyp-0d57673b-0 (P) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-0d57673b-1",
+          "formula": "(Q)",
+          "atom": "(: local-hyp-0d57673b-1 (Q) (STV 1.0 1.0))"
+        }
+      ]
+    },
+    {
+      "test_name": "or_elimination_after_cases",
+      "goal_index": 0,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_0.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_0.log",
+      "target_formula": "(R)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-5722b539-0",
+          "formula": "(Implication\n   (Premises (P))\n   (Conclusions (R))\n)",
+          "atom": "(: local-hyp-5722b539-0 (Implication\n   (Premises (P))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-5722b539-1",
+          "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+          "atom": "(: local-hyp-5722b539-1 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+        },
+        {
+          "index": 2,
+          "label": "local-hyp-5722b539-2",
+          "formula": "(P)",
+          "atom": "(: local-hyp-5722b539-2 (P) (STV 1.0 1.0))"
+        }
+      ]
+    },
+    {
+      "test_name": "or_elimination_after_cases",
+      "goal_index": 1,
+      "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_1.metta",
+      "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_1.log",
+      "target_formula": "(R)",
+      "hypotheses": [
+        {
+          "index": 0,
+          "label": "local-hyp-bead3b4e-0",
+          "formula": "(Implication\n   (Premises (P))\n   (Conclusions (R))\n)",
+          "atom": "(: local-hyp-bead3b4e-0 (Implication\n   (Premises (P))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+        },
+        {
+          "index": 1,
+          "label": "local-hyp-bead3b4e-1",
+          "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+          "atom": "(: local-hyp-bead3b4e-1 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+        },
+        {
+          "index": 2,
+          "label": "local-hyp-bead3b4e-2",
+          "formula": "(Q)",
+          "atom": "(: local-hyp-bead3b4e-2 (Q) (STV 1.0 1.0))"
+        }
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "test_name": "modus_ponens_after_apply",
+      "goal": "∀ (P Q : Prop), P → (P → Q) → Q",
+      "tactics": [
+        "intro P Q hP hPQ",
+        "apply hPQ"
+      ],
+      "status": "generated",
+      "num_subgoals": 1,
+      "subgoals": [
+        {
+          "test_name": "modus_ponens_after_apply",
+          "goal_index": 0,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/modus_ponens_after_apply_goal_0.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/modus_ponens_after_apply_goal_0.log",
+          "target_formula": "(P)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-b66d4908-0",
+              "formula": "(P)",
+              "atom": "(: local-hyp-b66d4908-0 (P) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-b66d4908-1",
+              "formula": "(Implication\n   (Premises (P))\n   (Conclusions (Q))\n)",
+              "atom": "(: local-hyp-b66d4908-1 (Implication\n   (Premises (P))\n   (Conclusions (Q))\n) (STV 1.0 1.0))"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "test_name": "chain_implication_after_apply_hQR",
+      "goal": "∀ (P Q R : Prop), P → (P → Q) → (Q → R) → R",
+      "tactics": [
+        "intro P Q R hP hPQ hQR",
+        "apply hQR"
+      ],
+      "status": "generated",
+      "num_subgoals": 1,
+      "subgoals": [
+        {
+          "test_name": "chain_implication_after_apply_hQR",
+          "goal_index": 0,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/chain_implication_after_apply_hQR_goal_0.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/chain_implication_after_apply_hQR_goal_0.log",
+          "target_formula": "(Q)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-fc658a6d-0",
+              "formula": "(P)",
+              "atom": "(: local-hyp-fc658a6d-0 (P) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-fc658a6d-1",
+              "formula": "(Implication\n   (Premises (P))\n   (Conclusions (Q))\n)",
+              "atom": "(: local-hyp-fc658a6d-1 (Implication\n   (Premises (P))\n   (Conclusions (Q))\n) (STV 1.0 1.0))"
+            },
+            {
+              "index": 2,
+              "label": "local-hyp-fc658a6d-2",
+              "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+              "atom": "(: local-hyp-fc658a6d-2 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "test_name": "and_commutativity_after_constructor",
+      "goal": "∀ (P Q : Prop), P ∧ Q → Q ∧ P",
+      "tactics": [
+        "intro P Q h",
+        "cases h",
+        "constructor"
+      ],
+      "status": "generated",
+      "num_subgoals": 2,
+      "subgoals": [
+        {
+          "test_name": "and_commutativity_after_constructor",
+          "goal_index": 0,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_0.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_0.log",
+          "target_formula": "(Q)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-5d45b6fa-0",
+              "formula": "(P)",
+              "atom": "(: local-hyp-5d45b6fa-0 (P) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-5d45b6fa-1",
+              "formula": "(Q)",
+              "atom": "(: local-hyp-5d45b6fa-1 (Q) (STV 1.0 1.0))"
+            }
+          ]
+        },
+        {
+          "test_name": "and_commutativity_after_constructor",
+          "goal_index": 1,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_1.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/and_commutativity_after_constructor_goal_1.log",
+          "target_formula": "(P)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-0d57673b-0",
+              "formula": "(P)",
+              "atom": "(: local-hyp-0d57673b-0 (P) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-0d57673b-1",
+              "formula": "(Q)",
+              "atom": "(: local-hyp-0d57673b-1 (Q) (STV 1.0 1.0))"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "test_name": "or_elimination_after_cases",
+      "goal": "∀ (P Q R : Prop), (P → R) → (Q → R) → P ∨ Q → R",
+      "tactics": [
+        "intro P Q R hPR hQR hOr",
+        "cases hOr"
+      ],
+      "status": "generated",
+      "num_subgoals": 2,
+      "subgoals": [
+        {
+          "test_name": "or_elimination_after_cases",
+          "goal_index": 0,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_0.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_0.log",
+          "target_formula": "(R)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-5722b539-0",
+              "formula": "(Implication\n   (Premises (P))\n   (Conclusions (R))\n)",
+              "atom": "(: local-hyp-5722b539-0 (Implication\n   (Premises (P))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-5722b539-1",
+              "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+              "atom": "(: local-hyp-5722b539-1 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+            },
+            {
+              "index": 2,
+              "label": "local-hyp-5722b539-2",
+              "formula": "(P)",
+              "atom": "(: local-hyp-5722b539-2 (P) (STV 1.0 1.0))"
+            }
+          ]
+        },
+        {
+          "test_name": "or_elimination_after_cases",
+          "goal_index": 1,
+          "metta_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_1.metta",
+          "log_path": "/home/nolawi/clone-maths/maths_ai/pln_inference/metta/tests/translator_output/or_elimination_after_cases_goal_1.log",
+          "target_formula": "(R)",
+          "hypotheses": [
+            {
+              "index": 0,
+              "label": "local-hyp-bead3b4e-0",
+              "formula": "(Implication\n   (Premises (P))\n   (Conclusions (R))\n)",
+              "atom": "(: local-hyp-bead3b4e-0 (Implication\n   (Premises (P))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+            },
+            {
+              "index": 1,
+              "label": "local-hyp-bead3b4e-1",
+              "formula": "(Implication\n   (Premises (Q))\n   (Conclusions (R))\n)",
+              "atom": "(: local-hyp-bead3b4e-1 (Implication\n   (Premises (Q))\n   (Conclusions (R))\n) (STV 1.0 1.0))"
+            },
+            {
+              "index": 2,
+              "label": "local-hyp-bead3b4e-2",
+              "formula": "(Q)",
+              "atom": "(: local-hyp-bead3b4e-2 (Q) (STV 1.0 1.0))"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

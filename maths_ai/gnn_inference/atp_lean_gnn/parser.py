@@ -12,6 +12,7 @@ _TOKEN_RE = re.compile(
     (?P<LPAREN>  \(                       ) |
     (?P<RPAREN>  \)                       ) |
     (?P<ARROW>   \u2192|->                ) |
+    (?P<COMMA>   ,                        ) |
     (?P<AT>      @                        ) |
     (?P<IDENT>   [^\s()\u2192@\[\]\u27e8\u27e9,;]+ )
     """,
@@ -28,11 +29,19 @@ class ExprParser:
     Recursive descent parser for a Lean-style expression.
 
     Grammar (simplified):
-        expr  := arrow
-        arrow := app  ( ("->" | "→") app )*
-        app   := atom+
-        atom  := IDENT | "(" expr ")" | "@" atom
+        expr     := arrow
+        arrow    := app ( ("->" | "→") app )*
+        app      := atom+
+        atom     := binder | IDENT | "(" expr ")" | "@" atom
+        binder   := ("∀" | "∃" | "λ" | "let") atom ("," expr)?
+
+    Binders like ``∀ (q : Prop), body`` are parsed into:
+        App(∀, App(App(q, :), Prop), body)
+
+    The comma separates the variable declaration from the body.
     """
+
+    _BINDER_LABELS = frozenset({"∀", "∃", "λ", "let"})
 
     def __init__(self, dag: "DAGBuilder"):
         self.dag = dag
@@ -56,6 +65,22 @@ class ExprParser:
         func = self._parse_atom()
         if func is None:
             return self.dag.get_or_create("?", ())
+
+        # Check if this is a binder: ∀/∃/λ followed by a parenthesized variable
+        func_label = self.dag.nodes[func].label if func < len(self.dag.nodes) else ""
+        if (func_label in self._BINDER_LABELS
+                and self._peek_type() == "LPAREN"):
+            # Parse the variable declaration (e.g., "(q : Prop)")
+            var_decl = self._parse_atom()
+            if var_decl is not None:
+                func = self.dag.get_or_create("App", (func, var_decl))
+                # Check for comma separating variable from body
+                if self._peek_type() == "COMMA":
+                    self._consume()
+                    # Parse the body
+                    body = self._parse_arrow()
+                    func = self.dag.get_or_create("App", (func, body))
+                    return func
 
         while True:
             arg = self._parse_atom()

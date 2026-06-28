@@ -19,8 +19,11 @@ BINDER_KIND_OTHER = 5     # other binder types
 
 _BINDER_LABEL_TO_KIND: dict[str, int] = {
     "∀": BINDER_KIND_FORALL,
+    "forall": BINDER_KIND_FORALL,
     "∃": BINDER_KIND_EXISTS,
+    "exists": BINDER_KIND_EXISTS,
     "λ": BINDER_KIND_LAMBDA,
+    "fun": BINDER_KIND_LAMBDA,
     "let": BINDER_KIND_LET,
 }
 

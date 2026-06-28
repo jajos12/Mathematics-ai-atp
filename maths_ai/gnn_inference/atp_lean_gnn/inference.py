@@ -39,12 +39,14 @@ def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
     return node.label
 
 
-def _extract_fresh_name(goal_expr: str) -> str:
-    """Extract a binder name from a ∀/forall goal, or generate 'h' for implications."""
-    match = re.search(r"(?:∀|forall)\s*\((\w+)", goal_expr)
-    if match:
-        return match.group(1)
-    return "h"
+def _extract_fresh_names_from_dag(dag: DAGBuilder) -> list[str]:
+    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes."""
+    from .graph import BINDER_KIND_FORALL
+    return [
+        node.label for node in dag.nodes
+        if node.is_bound == 1 and node.binder_kind == BINDER_KIND_FORALL
+        and not node.children  # leaf variable node
+    ]
 
 
 def _top_tactic_candidates(
@@ -230,15 +232,16 @@ class InferencePipeline:
 
             # ── Tactic-aware argument filtering ──────────────────────────
             if tactic_name in _FRESH_NAME_TACTICS:
-                fresh_name = _extract_fresh_name(state.goal)
+                fresh_names = _extract_fresh_names_from_dag(dag)
                 top_tactic_predictions.append(
                     {
                         "tactic_id": tactic_id,
                         "tactic_name": tactic_name,
                         "probability": float(candidate["probability"]),
-                        "selected_arguments": [fresh_name],
+                        "selected_arguments": fresh_names,
                         "selected_argument_details": [
-                            ArgumentPrediction(source="fresh", candidate_id=0, label=fresh_name, score=0.0)
+                            ArgumentPrediction(source="fresh", candidate_id=0, label=name, score=0.0)
+                            for name in fresh_names
                         ],
                     }
                 )

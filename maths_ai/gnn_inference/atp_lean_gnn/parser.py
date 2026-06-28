@@ -14,7 +14,8 @@ _TOKEN_RE = re.compile(
     (?P<ARROW>   \u2192|->                ) |
     (?P<COMMA>   ,                        ) |
     (?P<AT>      @                        ) |
-    (?P<IDENT>   [^\s()\u2192@\[\]\u27e8\u27e9,;]+ )
+    (?P<COLON>   :                        ) |
+    (?P<IDENT>   [^\s()\u2192@\[\]\u27e8\u27e9,;:]+ )
     """,
     re.VERBOSE,
 )
@@ -112,6 +113,10 @@ class ExprParser:
         if token_type == "IDENT":
             self._consume()
             return self.dag.get_or_create(token_value, ())
+
+        if token_type == "COLON":
+            self._consume()
+            return self.dag.get_or_create(":", ())
 
         return None
 

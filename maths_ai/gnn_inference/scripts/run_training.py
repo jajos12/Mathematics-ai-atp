@@ -161,7 +161,7 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     prepare_cfg = config["prepare"]
-    output_root = Path(config["prepared_root"])
+    output_root = Path(config["prepared_root"]).resolve()
 
     console_print("\n" + "=" * 60)
     console_print("  STAGE 1: PREPARE DATASET")
@@ -172,6 +172,23 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
     console_print(f"  Sample    : {prepare_cfg['sample_per_split'] or 'all'}")
     console_print(f"  Force     : {prepare_cfg['force']}")
     console_print("")
+
+    # Check if output already exists with valid data
+    if output_root.exists():
+        manifests_dir = output_root / "manifests"
+        has_data = manifests_dir.exists() and any(manifests_dir.glob("*.json"))
+        if has_data:
+            if prepare_cfg["force"]:
+                console_print("  Output exists but --force is set. Rebuilding...")
+            else:
+                console_print(f"  Output already exists at {output_root}")
+                console_print("  Skipping prepare stage. Use --prepare.force true to rebuild.")
+                return {
+                    "summary": {"skipped": True, "reason": "output exists"},
+                    "output_root": str(output_root),
+                }
+        else:
+            console_print(f"  Output directory exists but is empty/incomplete. Proceeding...")
 
     cfg = PreprocessConfig(
         dataset_name=prepare_cfg["dataset_name"],

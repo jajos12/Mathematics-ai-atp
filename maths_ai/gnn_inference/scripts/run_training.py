@@ -57,7 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "run_root": "maths_ai/gnn_inference/runs",
 
     "prepare": {
-        "dataset_name": "iCog-Labs-Dev/MathsATP_lean_4_wiki",
+        "dataset_name": "cat-searcher/leandojo-benchmark-4-random",
         "splits": "train,val,test",
         "sample_per_split": None,
         "force": False,

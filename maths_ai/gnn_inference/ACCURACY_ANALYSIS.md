@@ -1,104 +1,84 @@
 # Accuracy Analysis: Mathematics-ai-atp GNN Pipeline
 
 **Date**: 2026-06-29  
-**Status**: Findings document -- fixes not yet applied
+**Status**: Active analysis — fixes applied incrementally
 
 ---
 
 ## Executive Summary
 
-The GNN pipeline has **3 critical bugs** that cause immediate accuracy loss, **5 significant issues** that degrade training quality, and **several architectural limitations** that cap the system's potential.
-
-The most damaging bug: **inference uses forward-only edges while training uses bidirectional edges**. The model operates on graph topologies it has never seen during training.
+The GNN pipeline has **3 critical bugs** (P0), **5 significant architectural limitations** (P1), and **5 moderate issues** (P2). The most damaging is a **train/inference edge mode mismatch** — the model trains on bidirectional edges but infers on forward-only edges.
 
 ---
 
-## P0 -- Critical Bugs
+## P0 — Critical Bugs (fix immediately)
 
 ### Bug 1: Inference uses forward-only edges; training uses bidirectional
 
 **Files**: `inference.py:162`, `pyg.py:41`, `training.py:411-422`
 
-**What happens**:
-The DAG stores edges as `(child_id, parent_id)` -- directed child to parent (`graph.py:113`). During training, `transform_edge_index()` in `training.py:411-422` doubles these to bidirectional:
+**What happens**:  
+The DAG stores edges as `(child_id, parent_id)` — directed child→parent (`graph.py:113`). During training, `transform_edge_index()` doubles these to bidirectional:
+
 ```python
+# training.py:418-422
 forward = edge_index.to(dtype=torch.long)
-reverse = forward[[1, 0], :]  # flip child/parent
+reverse = forward[[1, 0], :]
 combined = torch.cat([forward, reverse], dim=1)
 ```
-The GNN backbone learns to aggregate information from both directions -- children influence parents AND parents influence children.
 
-But in `inference.py:162`:
+But at inference (`inference.py:162`):
 ```python
-data = dag_to_pyg(dag, self.node_vocab)
+data = dag_to_pyg(dag, self.node_vocab)  # add_reverse_edges=False (default)
 ```
-This does NOT pass `add_reverse_edges=True` (default is `False` at `pyg.py:41`). The inference code never calls `transform_edge_index`. So at inference, the GNN only sees forward edges (child->parent), meaning information flows only upward.
 
-**Why this kills accuracy**: The node embeddings at inference are fundamentally different from training. The tactic classifier and argument selector both operate on these degraded embeddings. This is a **train-test distribution mismatch** -- one of the most damaging bugs in ML.
+No `transform_edge_index` is ever called. The GNN sees a fundamentally different graph topology at inference.
 
-**Evidence**: The model predicts `constructor` (95% confidence) for `forall (p q: Prop), Or p q -> Or q p` when it should predict `intro`. The model's own predictions remain wrong because it sees a different graph than what it was trained on.
+**Impact**: Train-test distribution mismatch. The model's node embeddings at inference are computed on a graph it has never seen during training. This is one of the most damaging bugs in ML.
+
+**Fix**: Apply `transform_edge_index(batch.edge_index, edge_mode="bidirectional")` in `inference.py` after creating the batch.
 
 ---
 
-### Bug 2: Premise mask overridden to ALL nodes during argument selection training
+### Bug 2: Premise mask overridden to ALL nodes during argument selection
 
 **Files**: `argument_selector.py:243-247`, `pyg.py:89-107`
 
-**What happens**:
-`build_premise_mask()` in `pyg.py:89-107` carefully filters structural nodes:
+**What happens**:  
+`build_premise_mask()` carefully filters structural nodes:
 ```python
+# pyg.py:100-107
 _PREMISE_SELECTABLE_TYPES = {"var", "predicate", "type"}
 _PREMISE_SELECTABLE_META_LABELS = {"Hyp"}
 ```
-Only `var`, `predicate`, `type` nodes and `Hyp` (hypothesis) nodes are valid argument candidates. Structural nodes like `App`, `Arrow`, `Forall`, `State`, `Goal` are excluded.
 
-But in `argument_selector.py:243-247`:
+But `argument_selector.py:243-247` throws this away:
 ```python
 # Overwrite the cache's premise_mask if it's too restrictive
 node_types = data.node_type.to(device=node_embeddings.device)
 premise_mask = (node_types >= 0) & (node_types <= 5)
 ```
-Since `NODE_TYPE_TO_ID` maps types to integers 0-5, this condition is **always True**. Every node becomes a valid candidate.
 
-**Why this kills accuracy**: The pointer network trains on ALL nodes including `App`, `Arrow`, `State`, `Goal`. The ground-truth argument is a meaningful variable, but the model learns structural nodes are equally valid. At inference, the model may select `App` or `Arrow` nodes as arguments, producing invalid tactic strings.
+Since `NODE_TYPE_TO_ID` maps types to integers 0–5, this condition is **always True**. Every node becomes a valid candidate.
 
-The comment says "Overwrite if too restrictive" -- the right fix is to improve `build_premise_mask`, not bypass it.
+**Impact**: The pointer network trains on ALL nodes including `App`, `Arrow`, `State`, `Goal`. At inference, the model may select structural nodes as arguments.
 
----
-
-### Bug 3: Fresh name generation returns ALL bound variables instead of first
-
-**Files**: `inference.py:42-49`
-
-**What happens**:
-`_extract_fresh_names_from_dag()` returns ALL forall-bound leaf variable names:
-```python
-return [
-    node.label for node in dag.nodes
-    if node.is_bound == 1 and node.binder_kind == BINDER_KIND_FORALL
-    and not node.children
-]
-```
-For `forall (p q: Prop), Or p q -> Or q p`, this returns `['p', 'q']`.
-
-When the tactic is `intro` with arity 1, the model generates `intro p q` -- valid Lean syntax, but wrong for the prover loop. The prover expects each iteration to introduce ONE binder.
-
-**Impact**: Multi-argument `intro` when only one is expected. The proof tree depth is reduced, but subgoal ranking and hypothesis tracking become misaligned with the prover's loop structure.
+**Fix**: Remove lines 243-247. Use `data.premise_mask` directly.
 
 ---
 
-## P1 -- Significant Accuracy Loss
-
-### Issue 4: Score index mismatch for local-only tactics
+### Bug 3: Score index mismatch for local-only tactics
 
 **File**: `inference.py:259-277`
 
-When scoring local-only tactics (`cases`, `rcases`, `obtain`):
+**What happens**:  
 ```python
 local_sorted = local_scores.argsort(descending=True)[:arity]
 local_indices = torch.where(local_mask)[0][local_sorted]
 ...
-score=float(local_scores[local_indices.tolist().index(idx)].item())
+for idx in local_indices.tolist():
+    ...
+    score=float(local_scores[local_indices.tolist().index(idx)].item())
 ```
 
 `local_indices.tolist().index(idx)` finds the position of `idx` in the **global** `local_indices` tensor, but `local_scores` is indexed by position in the **filtered** local set. These index spaces are different.
@@ -107,30 +87,22 @@ Example:
 - `local_indices = [3, 7, 12]` (global positions)
 - `local_scores = [0.9, 0.3, 0.7]` (scored in filtered order)
 - For `idx=7`: `local_indices.tolist().index(7)` returns 1, so `local_scores[1] = 0.3`
-- But the correct score for candidate 7 depends on its rank in `local_sorted`, not its position in `local_indices`
+- But the correct score depends on the candidate's rank in `local_sorted`, not its position in `local_indices`
 
-**Impact**: Wrong confidence scores. Potential `IndexError` crash for certain tactic/candidate combinations.
+**Impact**: Wrong confidence scores. The candidate identity is correct, but the reported score is scrambled.
 
----
-
-### Issue 5: Argument ground-truth uses first-match label heuristic
-
-**File**: `preprocess.py:107-119`
-
-`_resolve_arg_node_indices()` builds:
+**Fix**: Use `enumerate` to track the rank position:
 ```python
-label_to_id = {}
-for node in dag.nodes:
-    if node.label not in label_to_id:
-        label_to_id[node.label] = node.id  # FIRST match wins
+for rank, idx in enumerate(local_indices.tolist()):
+    ...
+    score=float(local_scores[local_sorted[rank]].item())
 ```
-In a hash-consed DAG, multiple nodes can share the same label. The ground-truth argument may reference a different node with the same label. The training signal tells the model to select the wrong node.
-
-**Impact**: Noisy ground-truth argument labels degrade argument selection accuracy.
 
 ---
 
-### Issue 6: No residual connections in 4-layer GraphSAGE
+## P1 — Significant Architectural Limitations
+
+### Issue 4: No residual connections in 4-layer GraphSAGE
 
 **File**: `model.py:75-80`
 
@@ -142,13 +114,15 @@ for index, conv in enumerate(self.convs):
         x = self.dropout(x)
 ```
 
-With `num_layers=4` (default), deep GraphSAGE without residual connections suffers from **oversmoothing**: all node embeddings converge to similar values, losing discriminative power. After 4 layers of mean aggregation, every node's embedding is a weighted average of its 4-hop neighborhood -- nodes that started very different end up nearly identical.
+With `num_layers=4`, deep GraphSAGE without residual connections suffers from **oversmoothing**: all node embeddings converge to similar values, losing discriminative power.
 
-**Impact**: The GNN cannot distinguish between structurally similar but semantically different nodes. The classifier receives embeddings where all nodes look alike.
+**Impact**: The GNN cannot distinguish between structurally similar but semantically different nodes.
+
+**Fix**: Add skip connections: `x = x + conv(x, data.edge_index)`.
 
 ---
 
-### Issue 7: Readout is single State node only
+### Issue 5: Readout is single State node only
 
 **File**: `model.py:82-99`
 
@@ -157,17 +131,15 @@ def readout(self, node_embeddings, data):
     return node_embeddings.index_select(0, state_node_index)
 ```
 
-Only the `State` node embedding is used for classification. The entire graph's information must be aggregated into this single node through message passing. This creates a bottleneck:
-
-1. After 4 GNN layers, only nodes within 4 hops of State have influenced its embedding
-2. Distant but relevant nodes (deep in expression subtrees) may not contribute
-3. No attention mechanism to weight important neighbors differently
+Only the `State` node embedding is used for classification. The entire graph's information must be aggregated into this single node through message passing. After 4 GNN layers, only nodes within 4 hops of State contribute.
 
 **Impact**: Information loss for complex proof states with deep expression trees.
 
+**Fix**: Add global mean/max pooling alongside State node readout, or use attention-based readout.
+
 ---
 
-### Issue 8: Single pool built for all tactic candidates
+### Issue 6: Single pool built for all tactic candidates
 
 **File**: `inference.py:190-198`
 
@@ -188,20 +160,46 @@ Building one pool with one tactic-agnostic query means the same candidate set is
 
 ---
 
-## P2 -- Moderate Impact
+### Issue 7: Argument ground-truth uses first-match label heuristic
+
+**File**: `preprocess.py:107-119`
+
+```python
+label_to_id = {}
+for node in dag.nodes:
+    if node.label not in label_to_id:
+        label_to_id[node.label] = node.id  # FIRST match wins
+```
+
+In a hash-consed DAG, multiple nodes can share the same label. The ground-truth argument may reference a different node with the same label. The training signal tells the model to select the wrong node.
+
+**Impact**: Noisy ground-truth argument labels degrade argument selection accuracy.
+
+---
+
+### Issue 8: Inference bypasses TacticWithArgsClassifier.forward
+
+**File**: `inference.py:178-182`
+
+```python
+node_embeddings = self.model.backbone.encode_nodes(batch)
+state_emb = self.model.backbone.readout(node_embeddings, batch)
+tactic_logits = self.model.backbone.classifier(state_emb)
+```
+
+This bypasses `TacticWithArgsClassifier.forward` which has the autoregressive argument selection logic. Any improvements made to `forward` will not benefit inference. The inference code reimplements the pipeline manually.
+
+**Impact**: Code duplication, maintenance burden, and the two paths can diverge silently.
+
+---
+
+## P2 — Moderate Impact
 
 ### Issue 9: No edge-type encoding
 
 **File**: `pyg.py:37-81`
 
-All edges are treated identically. The DAG has semantically distinct edge types:
-- Parent-child in expressions
-- Hypothesis name to type
-- Goal to expression
-- State to hypothesis/Goal
-- Binder to variable
-
-These are not encoded. A typed edge representation would provide more structural information.
+All edges are treated identically. The DAG has semantically distinct edge types (parent-child, hypothesis name→type, goal→expression, state→hypothesis/goal, binder→variable). These are not encoded.
 
 ---
 
@@ -209,7 +207,7 @@ These are not encoded. A typed edge representation would provide more structural
 
 **File**: `premise_scoring.py:202-298`
 
-Cross-entropy is computed over the entire candidate pool. When the pool is large (k=500 from lemma index + local nodes) and only 1-2 are positive, the loss is dominated by easy negatives. Hard negative mining (selecting high-scoring negatives) would provide stronger training signal.
+Cross-entropy is computed over the entire candidate pool. When the pool is large (k=500) and only 1-2 are positive, the loss is dominated by easy negatives. Hard negative mining would provide stronger training signal.
 
 ---
 
@@ -217,26 +215,7 @@ Cross-entropy is computed over the entire candidate pool. When the pool is large
 
 **File**: `labels.py:46-112`
 
-Missing from `TACTIC_ARITY`:
-- `split` (0 args)
-- `exists` (1 arg)
-- `injection` (0 args)
-- `clear` (1 arg)
-- `revert` (1 arg)
-- `rename` (1 arg)
-- `swap` (0 args)
-- `rotate` (0 args)
-- `done` (0 args)
-- `sorry` (0 args)
-- `iterate` (0-1 args)
-- `repeat` (0-1 args)
-- `all_goals` (1 arg)
-- `any_goals` (1 arg)
-- `first` (multiple args)
-- `try` (1 arg)
-- `rwa` (1 arg)
-
-Default arity is 1, which may be wrong for 0-arg or multi-arg tactics.
+Missing from `TACTIC_ARITY`: `split`, `exists`, `injection`, `clear`, `revert`, `rename`, `swap`, `rotate`, `done`, `iterate`, `repeat`, `all_goals`, `any_goals`, `first`, `try`, `rwa`. Default arity is 1, which is wrong for 0-arg or multi-arg tactics.
 
 ---
 
@@ -244,52 +223,39 @@ Default arity is 1, which may be wrong for 0-arg or multi-arg tactics.
 
 **File**: `preparation.py:14-19`
 
-`PreparedExample` stores only the current proof state. Missing:
-- Previous proof states (tactic history)
-- Whether this is the first tactic applied
-- Success/failure status
-- Depth in the proof tree
-
-Without proof context, the model cannot learn sequential tactic patterns (e.g., `intro` is often followed by `simp` or `cases`).
+`PreparedExample` stores only the current proof state. Missing: previous proof states (tactic history), whether this is the first tactic applied, success/failure status, depth in the proof tree. Without proof context, the model cannot learn sequential tactic patterns.
 
 ---
 
-### Issue 13: Inference bypasses TacticWithArgsClassifier.forward
+### Issue 13: Training data prepared with old parser
 
-**File**: `inference.py:178-182`
+The dataset at `artifacts/prepared/v1/` was prepared before the parser comma fix (the fix that separates `q:` into `q` and `:` tokens, and recognizes `forall` text in addition to `∀` symbol). The trained models (baseline, pointer) were trained on old DAG topology. They need retraining.
 
-Inference manually calls:
-```python
-node_embeddings = self.model.backbone.encode_nodes(batch)
-state_emb = self.model.backbone.readout(node_embeddings, batch)
-tactic_logits = self.model.backbone.classifier(state_emb)
-```
+**Impact**: The model sees different graph patterns at inference than during training, contributing to wrong predictions like `constructor` for `∀ (p q : Prop), Or p q → Or q p`.
 
-This bypasses `TacticWithArgsClassifier.forward` which has the autoregressive argument selection logic. Any improvements made to `forward` will not benefit inference.
+**Fix**: Re-run `--stages prepare,baseline,pointer` to retrain with the fixed parser.
 
 ---
 
 ## Recommended Fix Priority
 
-### Immediate (do first -- biggest accuracy gains):
+### Immediate (P0 — biggest accuracy gains):
 
-1. **Fix Bug 1**: Add `transform_edge_index(batch.edge_index, edge_mode="bidirectional")` in `inference.py:162` or pass `add_reverse_edges=True` to `dag_to_pyg`.
+1. **Bug 1**: Add `transform_edge_index` in inference.py
+2. **Bug 2**: Remove premise_mask override in argument_selector.py
+3. **Bug 3**: Fix score index mapping in local-only tactic scoring
 
-2. **Fix Bug 2**: Remove the premise_mask override in `argument_selector.py:243-247`. Use `data.premise_mask` directly.
+### Soon (P1 — architecture improvements):
 
-3. **Fix Bug 3**: Change `_extract_fresh_names_from_dag` to return only `[:arity]` names.
+4. **Issue 4**: Add residual connections to GraphSAGE
+5. **Issue 5**: Add multi-head attention readout
+6. **Issue 6**: Build tactic-aware candidate pools
+7. **Issue 13**: Retrain models with fixed parser
 
-### Soon (significant gains):
+### Later (P2):
 
-4. **Fix Issue 4**: Fix the score index mapping in the local-only tactic scoring loop.
-
-5. **Fix Issue 6**: Add residual connections to GraphSAGE: `x = x + conv(x, edge_index)`.
-
-6. **Fix Issue 7**: Add multi-head attention readout or global mean pooling alongside State node readout.
-
-### Later (architecture improvements):
-
-7. Add edge-type encoding to `dag_to_pyg`
-8. Add hard negative mining to premise ranking loss
-9. Complete the arity registry
-10. Add proof history context to training examples
+8. Add edge-type encoding to `dag_to_pyg`
+9. Add hard negative mining to premise ranking loss
+10. Complete the arity registry
+11. Add proof history context to training examples
+12. Unify inference path with `TacticWithArgsClassifier.forward`

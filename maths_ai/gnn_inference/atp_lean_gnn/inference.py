@@ -20,6 +20,7 @@ from .premise_pool import build_unified_pools
 from .premise_scoring import PremiseScorer
 from .pyg import build_premise_mask, dag_to_pyg
 from .state import ProofState, parse_state
+from .training import transform_edge_index
 
 # ── Tactic-aware argument filtering rules ──────────────────────────────────
 # Fresh name only: generate a new identifier, reject all candidates
@@ -173,6 +174,8 @@ class InferencePipeline:
         data = data.to(self.device)
         data.state_node_index = data.state_node_index.to(self.device)
         data.premise_mask = data.premise_mask.to(self.device)
+        # Apply bidirectional edges to match training edge_mode
+        data.edge_index = transform_edge_index(data.edge_index, edge_mode="bidirectional")
         batch = Batch.from_data_list([data])
 
         node_embeddings = self.model.backbone.encode_nodes(batch)
@@ -263,18 +266,19 @@ class InferencePipeline:
 
                 arguments: list[str] = []
                 selected_argument_details: list[ArgumentPrediction] = []
-                for idx in local_indices.tolist():
+                for rank, idx in enumerate(local_indices.tolist()):
                     idx = int(idx)
                     cid = pool.candidate_ids[idx]
                     node = dag.nodes[cid]
                     arg_str = _resolve_local_node_name(node, dag)
                     arguments.append(arg_str)
+                    score_val = float(local_scores[local_sorted[rank]].item()) if len(local_indices) > 0 else 0.0
                     selected_argument_details.append(
                         ArgumentPrediction(
                             source="local",
                             candidate_id=cid,
                             label=arg_str,
-                            score=float(local_scores[local_indices.tolist().index(idx)].item()) if len(local_indices) > 0 else 0.0,
+                            score=score_val,
                         )
                     )
 

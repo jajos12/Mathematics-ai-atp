@@ -240,11 +240,7 @@ class TacticWithArgsClassifier(nn.Module):
             return tactic_logits, []
 
         # Autoregressive argument selection
-        # Overwrite the cache's premise_mask if it's too restrictive (e.g. missing 'app' or 'operator' nodes)
-        # Type IDs: var=0, type=1, predicate=2, operator=3, app=4, meta=5
-        # We allow selecting any of these common types as arguments.
-        node_types = data.node_type.to(device=node_embeddings.device)
-        premise_mask = (node_types >= 0) & (node_types <= 5)
+        premise_mask = data.premise_mask.to(device=node_embeddings.device)
         batch_index = data.batch.to(device=node_embeddings.device)
 
         arg_logits_list: list[Tensor] = []

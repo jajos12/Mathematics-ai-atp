@@ -454,6 +454,8 @@ async def main(
     dts_state_output: Optional[Path] = None,
     dts_c: float = None,
     dts_random_seed: Optional[int] = None,
+    top_k_tactics: int = 3,
+    top_k_subgoals: int = 3,
 
 ) -> None:
     server = await Server.create()
@@ -485,8 +487,8 @@ async def main(
         index_path=index_path,
         corpus_path=corpus_path,
         executor=PantographExecutor(server=server),
-        top_k_tactics=3,
-        top_k_subgoals=3,
+        top_k_tactics=top_k_tactics,
+        top_k_subgoals=top_k_subgoals,
         max_depth=depth_limit,
         max_nodes=500,
         dts_sampler=dts_sampler,
@@ -547,6 +549,18 @@ if __name__ == "__main__":
         default=None,
         help="Optional RNG seed for DTS sampling.",
     )
+    args_parser.add_argument(
+        "--top-k-tactics",
+        type=int,
+        default=3,
+        help="Number of top tactic candidates to try per node (default: 3).",
+    )
+    args_parser.add_argument(
+        "--top-k-subgoals",
+        type=int,
+        default=3,
+        help="Number of subgoal nodes to expand per tactic application (default: 3).",
+    )
     args = args_parser.parse_args()
 
     asyncio.run(main(
@@ -562,4 +576,6 @@ if __name__ == "__main__":
         dts_state_output=args.dts_state_output,
         dts_c=args.dts_c,
         dts_random_seed=args.dts_random_seed,
+        top_k_tactics=args.top_k_tactics,
+        top_k_subgoals=args.top_k_subgoals,
     ))

@@ -24,7 +24,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     BaselineConfig,
-    build_model,
+    build_baseline_model,
     load_baseline_config,
     load_prepared_metadata,
     resolve_device,
@@ -113,7 +113,7 @@ def build_index(
     config = _load_config_from_checkpoint(checkpoint_path, config_path=config_path)
     device = resolve_device(device_name)
 
-    model = build_model(metadata, config).to(device)
+    model = build_baseline_model(metadata, config).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

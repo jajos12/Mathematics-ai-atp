@@ -33,7 +33,7 @@ def build_unified_pools(
     premise_mask: Tensor,
     batch_index: Tensor,
     *,
-    lemma_index: LemmaIndexLike,
+    lemma_index: LemmaIndexLike | None = None,
     k: int = 500,
 ) -> list[CandidatePool]:
     """Return per-graph candidate pools combining local and library premises."""
@@ -45,11 +45,15 @@ def build_unified_pools(
     device = node_embeddings.device
     batch_size = int(state_vecs.size(0))
 
-    lemma_ids_batch, lemma_vecs_batch, _scores = lemma_index.search(state_vecs, k=k)
-    if len(lemma_ids_batch) != batch_size:
-        raise ValueError("lemma_index returned a batch size mismatch.")
-
-    lemma_vecs_batch = torch.from_numpy(lemma_vecs_batch).to(device=device, dtype=node_embeddings.dtype)
+    # Library search (optional)
+    if lemma_index is not None:
+        lemma_ids_batch, lemma_vecs_batch, _scores = lemma_index.search(state_vecs, k=k)
+        if len(lemma_ids_batch) != batch_size:
+            raise ValueError("lemma_index returned a batch size mismatch.")
+        lemma_vecs_batch = torch.from_numpy(lemma_vecs_batch).to(device=device, dtype=node_embeddings.dtype)
+    else:
+        lemma_ids_batch = [[] for _ in range(batch_size)]
+        lemma_vecs_batch = None
 
     pools: list[CandidatePool] = []
     for b in range(batch_size):
@@ -62,8 +66,8 @@ def build_unified_pools(
         local_vecs = node_embeddings.index_select(0, local_ids)
         local_id_list = [int(i - graph_offset) for i in local_ids.tolist()]
 
-        lemma_ids = [int(x) for x in lemma_ids_batch[b]]
-        lemma_vecs = lemma_vecs_batch[b]
+        lemma_ids = [int(x) for x in lemma_ids_batch[b]] if lemma_ids_batch else []
+        lemma_vecs = lemma_vecs_batch[b] if lemma_vecs_batch is not None else torch.empty(0, node_embeddings.size(1), device=device)
 
         if local_vecs.numel() == 0:
             candidate_vectors = lemma_vecs

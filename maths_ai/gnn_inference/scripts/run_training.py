@@ -462,12 +462,19 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
 
     lemma_index_file = None
     for candidate in [
+        lemma_index_dir / "faiss.index",
         lemma_index_dir / "lemma_index.faiss",
+        lemma_index_dir / "index" / "faiss.index",
         lemma_index_dir / "index" / "lemma_index.faiss",
     ]:
         if candidate.exists():
             lemma_index_file = candidate
             break
+
+    # Also try the directory itself (LemmaIndex.load accepts directories)
+    if lemma_index_file is None and lemma_index_dir.exists():
+        if (lemma_index_dir / "faiss.index").exists():
+            lemma_index_file = lemma_index_dir
 
     if lemma_index_file is None:
         console_print("  WARNING: No lemma index found. Scorer training will use local candidates only.")

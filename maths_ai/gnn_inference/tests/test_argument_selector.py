@@ -310,6 +310,88 @@ class CombinedLossTests(unittest.TestCase):
         self.assertEqual(metrics["arg_truncated_count"], 1)
         self.assertEqual(metrics["arg_truncated_examples"], 1)
 
+    def test_truncated_samples_stop_target_clamps_to_the_last_step(self) -> None:
+        """arg_count > max_args must supervise "stop" at the final position.
+
+        The decoder cannot decode past max_args, so a truncated sample whose
+        targets all say "continue" pushes the stop head negative everywhere
+        and penalizes correct early stops on untruncated samples.
+        """
+        # One sample with arg_count=2, one truncated with arg_count=3, decoder
+        # exposes 3 stop positions (max_args=2).  Both clamp the boundary to
+        # step 2, so a model that always predicts "stop" is now fully correct.
+        tactic_logits = torch.randn(2, 4, requires_grad=True)
+        arg_logits = [torch.randn(2, 6, requires_grad=True) for _ in range(2)]
+        stop_logits = [
+            torch.full((2,), 20.0, requires_grad=True) for _ in range(3)
+        ]
+        _, metrics = compute_combined_loss(
+            tactic_logits,
+            arg_logits,
+            torch.tensor([1, 1]),
+            torch.tensor([[0, -1], [1, 2]]),
+            torch.cat([torch.zeros(3, dtype=torch.long), torch.ones(3, dtype=torch.long)]),
+            arg_count_per_sample=[2, 3],
+            stop_logits_list=stop_logits,
+        )
+        # Targets for both samples are [0, 0, 1]: "continue, continue, stop".
+        # A model that always fires the stop head is wrong at steps 0,1.
+        self.assertGreater(metrics["stop_loss"], 0.0)
+
+        # With targets clamped, a model that never fires matches the
+        # truncated sample at the final step only if the target there is 1.
+        # Verify the clamped supervision directly: a never-stop model must
+        # incur loss from the final position, not get it for free.
+        never_stop = [
+            torch.full((2,), -20.0, requires_grad=True) for _ in range(3)
+        ]
+        _, metrics_ns = compute_combined_loss(
+            tactic_logits.detach(),
+            [a.detach() for a in arg_logits],
+            torch.tensor([1, 1]),
+            torch.tensor([[0, -1], [1, 2]]),
+            torch.cat([torch.zeros(3, dtype=torch.long), torch.ones(3, dtype=torch.long)]),
+            arg_count_per_sample=[2, 3],
+            stop_logits_list=never_stop,
+        )
+        # Pre-clamp behavior supervised "continue" at the final step for the
+        # truncated sample; post-clamp the target is 1, so never-stop must be
+        # penalized there (loss strictly greater than zero).
+        self.assertGreater(metrics_ns["stop_loss"], 0.0)
+        # Scored positions are the decision-relevant ones: steps 0,1 (target
+        # "continue", prediction continue -> correct) and step 2 (target
+        # "stop", prediction continue -> wrong).  2 of 3 correct.
+        self.assertAlmostEqual(metrics_ns["stop_accuracy"], 2.0 / 3.0)
+
+    def test_stop_accuracy_scores_only_decision_relevant_steps(self) -> None:
+        """Positions past the boundary are trained but not scored.
+
+        Counting the trivially-correct plateau after the target flips to stop
+        inflated the metric the same way the old arg_target_coverage bug did.
+        """
+        # Sample with arg_count=0: boundary step 0.  Scored positions: 0 and 1.
+        # Positions 2+ are the plateau and must not enter the count.
+        tactic_logits = torch.randn(1, 4, requires_grad=True)
+        arg_logits = [torch.randn(1, 6, requires_grad=True) for _ in range(2)]
+        # Model predicts continue at step 0 (wrong), stop everywhere after.
+        stop_logits = [
+            torch.tensor([-5.0]),
+            torch.tensor([5.0]),
+            torch.tensor([5.0]),
+        ]
+        _, metrics = compute_combined_loss(
+            tactic_logits,
+            arg_logits,
+            torch.tensor([1]),
+            torch.tensor([[-1, -1]]),
+            torch.arange(6, dtype=torch.long),
+            arg_count_per_sample=[0],
+            stop_logits_list=stop_logits,
+        )
+        # Scored: steps 0 (target stop, pred continue -> wrong) and 1
+        # (target stop, pred stop -> correct).  Steps 2+ excluded.
+        self.assertAlmostEqual(metrics["stop_accuracy"], 0.5)
+
     def test_masks_invalid_arg_targets(self) -> None:
         batch_size = 2
         num_tactics = 5

@@ -20,7 +20,10 @@ from maths_ai.gnn_inference.atp_lean_gnn import inference as inference_module
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import (
     TacticWithArgsClassifier,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.inference import InferencePipeline
+from maths_ai.gnn_inference.atp_lean_gnn.inference import (
+    InferencePipeline,
+    _extract_fresh_names_from_dag,
+)
 
 
 STATE = "h1 : P\nh2 : Q\n⊢ P ∧ Q"
@@ -81,7 +84,6 @@ class InferenceDecodeTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         pipeline = InferencePipeline(
                 model=model,
-                scorer=SimpleNamespace(eval=lambda: None),
                 lemma_index=object(),
                 node_vocab=node_vocab,
                 tactic_vocab=tactic_vocab,
@@ -130,6 +132,66 @@ class InferenceDecodeTests(unittest.TestCase):
             self.assertEqual(candidate["selected_arguments"], [])
             self.assertEqual(candidate["selected_argument_details"], [])
         self.assertEqual(result.selected_arguments, [])
+
+    def test_pipeline_constructs_without_a_scorer(self) -> None:
+        """The decoder owns argument selection; no scorer is required."""
+        pipeline, _ = self._build_pipeline(stop_bias=-10.0)
+        self.assertIsNone(pipeline.scorer)
+        # A full prediction still works without one.
+        result = pipeline.predict_tactic_result(STATE, top_k=1)
+        self.assertEqual(len(result.top_tactic_predictions), 1)
+
+    def test_fresh_name_tactics_take_their_count_from_the_stop_head(self) -> None:
+        """``intro`` emits only as many fresh names as the stop head allows.
+
+        A never-firing stop head yields the goal's outermost forall binder; a
+        step-0 stop yields none.  Both cases replace the old behavior of
+        emitting the full DAG walk regardless of the model's decision.  The
+        classifier bias is set so ``intro`` ranks in the top-k, and the goal
+        type is supplied as a model S-expression so the DAG carries binder
+        annotations (the text parser does not mark them).
+        """
+        text_state = "⊢ P a b"
+        goal_sexp = (
+            "(:forall a (:const Nat) "
+            "(:forall b (:const Nat) (:app (:const P) (:fvar a) (:fvar b))))"
+        )
+        intro_id = 5
+
+        pipeline, _ = self._build_pipeline(stop_bias=-10.0)
+        with torch.no_grad():
+            pipeline.model.backbone.classifier.bias.fill_(-10.0)
+            pipeline.model.backbone.classifier.bias[intro_id] = 10.0
+        dag = proof_state_to_dag(text_state, sexp=goal_sexp)
+        # One outermost binder (depth 1) is selectable by intro.
+        self.assertEqual(_extract_fresh_names_from_dag(dag), ["a"])
+        result = pipeline._predict_from_dag(dag, top_k=3)
+
+        fresh = [
+            c for c in result.top_tactic_predictions
+            if c["tactic_name"] in {"intro", "rintro", "introV2"}
+        ]
+        self.assertTrue(fresh, "expected at least one fresh-name tactic candidate")
+        for candidate in fresh:
+            self.assertEqual(candidate["selected_arguments"], ["a"])
+            for detail in candidate["selected_argument_details"]:
+                self.assertEqual(detail.source, "fresh")
+
+        # A firing stop head must yield zero names for the same tactic.
+        pipeline_stop, _ = self._build_pipeline(stop_bias=10.0)
+        with torch.no_grad():
+            pipeline_stop.model.backbone.classifier.bias.fill_(-10.0)
+            pipeline_stop.model.backbone.classifier.bias[intro_id] = 10.0
+        result_stop = pipeline_stop._predict_from_dag(
+            proof_state_to_dag(text_state, sexp=goal_sexp), top_k=3
+        )
+        fresh_stop = [
+            c for c in result_stop.top_tactic_predictions
+            if c["tactic_name"] in {"intro", "rintro", "introV2"}
+        ]
+        self.assertTrue(fresh_stop)
+        for candidate in fresh_stop:
+            self.assertEqual(candidate["selected_arguments"], [])
 
 
 if __name__ == "__main__":

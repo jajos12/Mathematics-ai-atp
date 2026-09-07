@@ -166,18 +166,24 @@ class InferenceResult:
 
 
 class InferencePipeline:
-    """End-to-end tactic prediction pipeline."""
+    """End-to-end tactic prediction pipeline.
+
+    Argument selection is performed by the model's recurrent pointer decoder
+    over the unified candidate pool, so the standalone ``PremiseScorer`` plays
+    no role in decoding.  ``scorer`` is accepted and stored for backward
+    compatibility with callers that still load one, but it is never consulted.
+    """
 
     def __init__(
         self,
         model: TacticWithArgsClassifier,
-        scorer: PremiseScorer,
         lemma_index: LemmaIndex,
         node_vocab: dict[str, int],
         tactic_vocab: dict[str, int],
         device: torch.device,
         k: int = 500,
         lemma_corpus: dict[int, LemmaRecord] | None = None,
+        scorer: PremiseScorer | None = None,
     ) -> None:
         self.model = model
         self.scorer = scorer
@@ -192,7 +198,6 @@ class InferencePipeline:
         self.id_to_tactic = {idx: name for name, idx in tactic_vocab.items()}
 
         self.model.eval()
-        self.scorer.eval()
 
     @torch.no_grad()
     def predict_tactic(self, state_str: str) -> str:
@@ -292,16 +297,45 @@ class InferencePipeline:
 
             # ── Tactic-aware argument filtering ──────────────────────────
             if tactic_name in _FRESH_NAME_TACTICS:
+                # The stop head governs how many names to generate, the same
+                # rule as every other tactic.  The candidates are the outermost
+                # forall binders of the goal, not DAG pointer targets, so the
+                # names themselves still come from the DAG walk.
                 fresh_names = _extract_fresh_names_from_dag(dag)
+                decoder_state = self.model.argument_selector.initial_state(
+                    state_emb, tactic_emb
+                )
+                fresh_count = 0
+                for step in range(self.model.max_args + 1):
+                    if float(self.model.stop_head(decoder_state).item()) >= 0:
+                        break
+                    if step == self.model.max_args:
+                        break
+                    if fresh_count >= len(fresh_names):
+                        break
+                    # The decoder still consumes a candidate embedding so the
+                    # recurrence advances; the binder's node embedding is not
+                    # in the pool, so the selected fresh name stands in for it.
+                    name = fresh_names[fresh_count]
+                    fresh_count += 1
+                    fresh_idx = next(
+                        (i for i, n in enumerate(dag.nodes) if n.label == name), 0
+                    )
+                    fresh_emb = node_embeddings[
+                        torch.tensor([fresh_idx], device=self.device)
+                    ]
+                    decoder_state = self.model.argument_selector.gru(
+                        fresh_emb, decoder_state
+                    )
                 top_tactic_predictions.append(
                     {
                         "tactic_id": tactic_id,
                         "tactic_name": tactic_name,
                         "probability": float(candidate["probability"]),
-                        "selected_arguments": fresh_names,
+                        "selected_arguments": fresh_names[:fresh_count],
                         "selected_argument_details": [
                             ArgumentPrediction(source="fresh", candidate_id=0, label=name, score=0.0)
-                            for name in fresh_names
+                            for name in fresh_names[:fresh_count]
                         ],
                     }
                 )

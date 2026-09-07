@@ -443,16 +443,43 @@ def compute_combined_loss(
     stop_correct = 0
     stop_count = 0
     if stop_logits_list:
+        n_stop_steps = len(stop_logits_list)
+        # A sample whose arg_count exceeds the decoder's capacity cannot have
+        # its true "continue" targets honored: the model physically cannot
+        # decode past max_args, so the last position is supervised as "stop"
+        # instead.  Without the clamp, every truncated sample is told to keep
+        # going at a step the decoder cannot take, which pushes the stop head
+        # negative everywhere and penalizes correct early stops.
         stop_targets = torch.tensor(
-            [[step >= count for step in range(len(stop_logits_list))]
+            [[
+                min(step, count) >= min(count, n_stop_steps - 1)
+                for step in range(n_stop_steps)
+            ]
              for count in arg_count_per_sample],
             device=device,
             dtype=torch.float32,
         )
         stop_logits = torch.stack(stop_logits_list, dim=1)
         stop_loss = F.binary_cross_entropy_with_logits(stop_logits, stop_targets)
-        stop_correct = int(((stop_logits >= 0) == stop_targets.bool()).sum().item())
-        stop_count = int(stop_targets.numel())
+        # Count only the decision-relevant positions: the boundary step and
+        # one step past it.  After the target flips to stop, later positions
+        # are trivially "already stopped" and would inflate the accuracy the
+        # same way the old arg_target_coverage bug did.  Positions beyond the
+        # boundary are still trained (the head must stay on once it fires)
+        # but they do not score.
+        boundary = torch.tensor(
+            [min(count, n_stop_steps - 1) for count in arg_count_per_sample],
+            device=device,
+            dtype=torch.long,
+        )
+        steps = torch.arange(n_stop_steps, device=device).unsqueeze(0)
+        scored = steps <= boundary.unsqueeze(1) + 1
+        stop_correct = int(
+            (
+                ((stop_logits >= 0) == stop_targets.bool()) & scored
+            ).sum().item()
+        )
+        stop_count = int(scored.sum().item())
 
         for sample_index, target_count in enumerate(arg_count_per_sample):
             predicted_count = len(stop_logits_list)

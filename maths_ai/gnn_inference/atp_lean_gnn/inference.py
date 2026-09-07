@@ -338,9 +338,12 @@ class InferencePipeline:
                     break
                 if step == self.model.max_args:
                     break
+                # score_candidates keeps the decoder batch dimension, so a
+                # single-graph decode returns [1, P]; flatten it to [P] before
+                # indexing positions into it.
                 scores = self.model.argument_selector.score_candidates(
                     decoder_state, candidate_vectors
-                )
+                ).squeeze(0)
                 scores = scores.masked_fill(selected_positions, float("-inf"))
                 selected_position = int(scores.argmax().item())
                 selected_score = float(scores[selected_position].item())

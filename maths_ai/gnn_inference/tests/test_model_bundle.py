@@ -564,6 +564,78 @@ class ModelBundleTests(unittest.TestCase):
         self.assertIn("pointer", VALID_MODEL_TYPES)
         self.assertIn("pointer_gru", VALID_MODEL_TYPES)
 
+    def test_a_legacy_pointer_bundle_loads_into_the_gru_architecture(self) -> None:
+        """Pre-GRU pointer checkpoints must keep loading after the decoder swap.
+
+        The old ArgumentSelector head (query_proj / query_proj_ar) has no
+        counterpart in the current architecture, so loading one is a declared
+        partial transfer: the legacy head's keys are dropped by name, the GRU
+        decoder and stop head stay random, and every other key must still
+        round-trip exactly.
+        """
+        checkpoint_path = self.run_root / "legacy_pointer" / "best.pt"
+        config, payload = self._write_pointer_checkpoint(checkpoint_path)
+
+        hidden = int(config.model.hidden_dim)
+        legacy = {
+            key: value
+            for key, value in payload["model_state_dict"].items()
+            if not key.startswith("argument_selector.")
+            and not key.startswith("stop_head.")
+        }
+        legacy["argument_selector.query_proj.weight"] = torch.randn(hidden, hidden * 2)
+        legacy["argument_selector.query_proj.bias"] = torch.randn(hidden)
+        legacy["argument_selector.query_proj_ar.weight"] = torch.randn(hidden, hidden * 3)
+        legacy["argument_selector.query_proj_ar.bias"] = torch.randn(hidden)
+        payload["model_state_dict"] = legacy
+        torch.save(payload, checkpoint_path)
+
+        bundle_dir = self.export_root / "legacy_pointer"
+        manifest = export_model_bundle(
+            checkpoint_path=checkpoint_path, output_dir=bundle_dir
+        )
+        self.assertEqual(manifest["model_type"], "pointer")
+
+        self._delete_prepared_root()
+        loaded = load_pointer_bundle(bundle_dir, device="cpu")
+        self.assertEqual(loaded.model_type, "pointer")
+
+        # The backbone, tactic embedding, and everything else the legacy
+        # checkpoint carried must round-trip untouched; only the replaced
+        # head's keys were dropped.
+        for key, expected in legacy.items():
+            if key.startswith("argument_selector.query_proj"):
+                continue
+            self.assertTrue(
+                torch.equal(expected, loaded.model.state_dict()[key]),
+                msg=f"parameter '{key}' changed across the legacy round trip",
+            )
+
+    def test_a_legacy_pointer_bundle_still_rejects_foreign_keys(self) -> None:
+        """Legacy tolerance must not become a blanket strict=False.
+
+        Dropping query_proj keys by name is the only declared gap: a legacy
+        checkpoint carrying a key the current model does not know under any
+        other prefix still fails the load.
+        """
+        checkpoint_path = self.run_root / "legacy_pointer_bad" / "best.pt"
+        config, payload = self._write_pointer_checkpoint(checkpoint_path)
+
+        legacy = {
+            key: value
+            for key, value in payload["model_state_dict"].items()
+            if not key.startswith("argument_selector.")
+            and not key.startswith("stop_head.")
+        }
+        legacy["argument_selector.query_proj.weight"] = torch.randn(16, 32)
+        legacy["argument_selector.not_a_real_module.weight"] = torch.randn(4, 4)
+        payload["model_state_dict"] = legacy
+        torch.save(payload, checkpoint_path)
+
+        bundle_dir = self.export_root / "legacy_pointer_bad"
+        with self.assertRaises(ValueError):
+            export_model_bundle(checkpoint_path=checkpoint_path, output_dir=bundle_dir)
+
     def test_a_baseline_bundle_is_wrapped_into_a_pointer_and_says_what_is_random(
         self,
     ) -> None:

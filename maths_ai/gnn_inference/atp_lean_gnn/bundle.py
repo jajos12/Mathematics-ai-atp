@@ -85,6 +85,17 @@ POINTER_RANDOM_PREFIXES = (
     "stop_head.",
 )
 
+# A legacy pointer checkpoint (exported before the GRU decoder) carries the old
+# ArgumentSelector head -- query_proj / query_proj_ar -- which the current
+# architecture replaced.  Loading one into the current model is a declared
+# partial transfer: the legacy head's keys are dropped by name and the GRU
+# decoder plus stop head stay randomly initialized, exactly like a baseline
+# wrap.  Everything else must still match.
+LEGACY_POINTER_HEAD_PREFIXES = (
+    "argument_selector.query_proj",
+    "argument_selector.query_proj_ar",
+)
+
 BUNDLE_FORMAT_VERSION = 1
 
 
@@ -205,6 +216,7 @@ def load_state_dict_checked(
     state_dict: Mapping[str, torch.Tensor],
     *,
     allow_missing_prefixes: Sequence[str] = (),
+    allow_unexpected_prefixes: Sequence[str] = (),
 ) -> list[str]:
     """Load ``state_dict`` into ``model``, tolerating only declared gaps.
 
@@ -214,6 +226,12 @@ def load_state_dict_checked(
     missing keys under ``allow_missing_prefixes`` and rejects everything else,
     which keeps the diagnostic strength of ``strict=True`` for the cases that
     are actually mistakes.
+
+    ``allow_unexpected_prefixes`` covers the mirror case: keys the checkpoint
+    carries that the current architecture has no parameter for.  The only
+    intended use is loading a legacy checkpoint whose head was replaced by a
+    newer architecture, so the legacy head's weights are dropped by name rather
+    than failing the load.
 
     Returns the missing keys that were allowed, so a caller can report which
     submodules are still randomly initialized.
@@ -240,11 +258,17 @@ def load_state_dict_checked(
         for key in missing
         if not any(key.startswith(prefix) for prefix in allow_missing_prefixes)
     ]
+    unexplained_unexpected = [
+        key
+        for key in unexpected
+        if not any(key.startswith(prefix) for prefix in allow_unexpected_prefixes)
+    ]
 
     problems: list[str] = []
-    if unexpected:
+    if unexplained_unexpected:
         problems.append(
-            f"{len(unexpected)} unexpected key(s), e.g. {', '.join(unexpected[:5])}"
+            f"{len(unexplained_unexpected)} unexpected key(s), "
+            f"e.g. {', '.join(unexplained_unexpected[:5])}"
         )
     if unexplained:
         problems.append(
@@ -588,7 +612,19 @@ def export_model_bundle(
         if model_type in {"pointer", "pointer_gru"}
         else build_baseline_model(metadata, config)
     )
-    load_state_dict_checked(probe, state_dict)
+    if model_type == "pointer":
+        # Same declared partial transfer as load_model_bundle: a legacy
+        # pointer checkpoint's old head is dropped, the GRU decoder stays
+        # random.  Everything else must still match, so a corrupt export
+        # still fails before anything is written.
+        load_state_dict_checked(
+            probe,
+            state_dict,
+            allow_missing_prefixes=POINTER_RANDOM_PREFIXES,
+            allow_unexpected_prefixes=LEGACY_POINTER_HEAD_PREFIXES,
+        )
+    else:
+        load_state_dict_checked(probe, state_dict)
 
     resolved_format = _resolve_weights_format(weights_format)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -837,7 +873,22 @@ def load_model_bundle(
         if model_type in {"pointer", "pointer_gru"}
         else build_baseline_model(metadata, config)
     )
-    load_state_dict_checked(model, state_dict)
+    if model_type == "pointer":
+        # Legacy pre-GRU pointer checkpoint.  The manifest says "pointer" only
+        # when the weights carry no GRU decoder, so this is the one model_type
+        # whose load is a declared partial transfer: the old
+        # query_proj/query_proj_ar head has no counterpart in the current
+        # architecture and is dropped by name, while the GRU decoder and stop
+        # head stay randomly initialized.  A modern "pointer_gru" bundle must
+        # match exactly, and so must every other key of a legacy one.
+        load_state_dict_checked(
+            model,
+            state_dict,
+            allow_missing_prefixes=POINTER_RANDOM_PREFIXES,
+            allow_unexpected_prefixes=LEGACY_POINTER_HEAD_PREFIXES,
+        )
+    else:
+        load_state_dict_checked(model, state_dict)
     model = model.to(device)
 
     scorer: PremiseScorer | None = None

@@ -16,7 +16,6 @@ from torch.optim import AdamW
 from torch_geometric.loader import DataLoader
 
 from .argument_selector import TacticWithArgsClassifier, compute_combined_loss
-from .labels import get_tactic_arity
 from .reporting import console_print
 
 
@@ -111,7 +110,7 @@ def train_one_epoch_with_args(
         targets = batch.y.view(-1)
         tactic_names = _extract_tactic_names(batch)
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
-        tactic_arities = [get_tactic_arity(n) for n in tactic_names]
+        arg_counts = [int(value) for value in batch.arg_count.tolist()]
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(
@@ -119,10 +118,10 @@ def train_one_epoch_with_args(
             dtype=amp_dtype,
             enabled=use_amp,
         ):
-            tactic_logits, arg_logits_list = model(
+            tactic_logits, arg_logits_list, stop_logits_list = model(
                 batch,
                 teacher_tactic_ids=targets,
-                tactic_names=tactic_names,
+                arg_targets=arg_targets,
             )
             loss, metrics = compute_combined_loss(
                 tactic_logits,
@@ -130,7 +129,8 @@ def train_one_epoch_with_args(
                 targets,
                 arg_targets,
                 batch.batch,
-                tactic_arity_per_sample=tactic_arities,
+                arg_count_per_sample=arg_counts,
+                stop_logits_list=stop_logits_list,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
                 # Diagnosis fields
@@ -202,6 +202,13 @@ def evaluate_model_with_args(
     arg_top5_correct = 0
     arg_valid_count = 0
     arg_target_count = 0
+    exact_sequence_correct = 0
+    sequence_count = 0
+    stop_correct = 0.0
+    stop_count = 0
+    family_metrics: dict[str, dict[str, int]] = {}
+    oracle_exact_sequence_correct = 0
+    oracle_sequence_count = 0
     total_batches = len(loader)
     start_time = time.perf_counter()
 
@@ -213,24 +220,38 @@ def evaluate_model_with_args(
         targets = batch.y.view(-1)
         tactic_names = _extract_tactic_names(batch)
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
-        tactic_arities = [get_tactic_arity(n) for n in tactic_names]
+        arg_counts = [int(value) for value in batch.arg_count.tolist()]
 
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
             enabled=use_amp,
         ):
-            tactic_logits, arg_logits_list = model(
-                batch,
-                tactic_names=tactic_names,
-            )
+            tactic_logits, arg_logits_list, stop_logits_list = model(batch)
             _, metrics = compute_combined_loss(
                 tactic_logits,
                 arg_logits_list,
                 targets,
                 arg_targets,
                 batch.batch,
-                tactic_arity_per_sample=tactic_arities,
+                arg_count_per_sample=arg_counts,
+                stop_logits_list=stop_logits_list,
+                arg_loss_weight=arg_loss_weight,
+                unknown_tactic_id=unknown_tactic_id,
+            )
+            _, oracle_arg_logits, oracle_stop_logits = model(
+                batch,
+                teacher_tactic_ids=targets,
+                arg_targets=arg_targets,
+            )
+            _, oracle_metrics = compute_combined_loss(
+                tactic_logits,
+                oracle_arg_logits,
+                targets,
+                arg_targets,
+                batch.batch,
+                arg_count_per_sample=arg_counts,
+                stop_logits_list=oracle_stop_logits,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
             )
@@ -243,6 +264,20 @@ def evaluate_model_with_args(
         arg_top5_correct += int(metrics.get("arg_top5_correct", 0))
         arg_valid_count += int(metrics.get("arg_valid_count", 0))
         arg_target_count += int(metrics.get("arg_target_count", 0))
+        exact_sequence_correct += int(metrics.get("arg_exact_sequence_correct", 0))
+        sequence_count += int(metrics.get("arg_sequence_count", bs))
+        oracle_exact_sequence_correct += int(
+            oracle_metrics.get("arg_exact_sequence_correct", 0)
+        )
+        oracle_sequence_count += int(oracle_metrics.get("arg_sequence_count", bs))
+        stop_correct += float(metrics.get("stop_accuracy", 0.0)) * bs
+        stop_count += bs
+        exact_flags = list(metrics.get("arg_exact_sequence_flags", [0] * bs))
+        for sample_index, tactic_name in enumerate(tactic_names):
+            family = str(tactic_name).split(".", 1)[0] or "unknown"
+            family_metrics.setdefault(family, {"count": 0, "exact_sequence_correct": 0})
+            family_metrics[family]["count"] += 1
+            family_metrics[family]["exact_sequence_correct"] += int(exact_flags[sample_index])
 
         # Tactic top-1 accuracy (excluding UNK)
         known_mask = targets != unknown_tactic_id
@@ -283,6 +318,13 @@ def evaluate_model_with_args(
         "arg_valid_count": arg_valid_count,
         "arg_target_count": arg_target_count,
         "arg_target_coverage": arg_valid_count / max(arg_target_count, 1),
+        "arg_exact_sequence_accuracy": exact_sequence_correct / max(sequence_count, 1),
+        "arg_exact_sequence_accuracy_oracle_tactic": oracle_exact_sequence_correct / max(oracle_sequence_count, 1),
+        "arg_exact_sequence_accuracy_predicted_tactic": exact_sequence_correct / max(sequence_count, 1),
+        "arg_position_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
+        "arg_position_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
+        "stop_accuracy": stop_correct / max(stop_count, 1),
+        "arg_family_metrics": family_metrics,
         "known_label_count": known_count,
         "evaluated_count": total_count,
     }

@@ -73,13 +73,17 @@ TORCH_MODEL_NAME = "model.pt"
 SAFETENSORS_SCORER_NAME = "scorer.safetensors"
 TORCH_SCORER_NAME = "scorer.pt"
 COPIED_RUN_FILES = ("summary.json", "metrics.jsonl")
-VALID_MODEL_TYPES = ("baseline", "pointer")
+VALID_MODEL_TYPES = ("baseline", "pointer", "pointer_gru")
 VALID_WEIGHTS_FORMATS = ("auto", "safetensors", "torch")
 
 # A pointer model built from baseline weights alone legitimately has these two
 # submodules left at their random initialization: the baseline has no argument
 # head, and its tactic embedding is seeded from the classifier afterwards.
-POINTER_RANDOM_PREFIXES = ("tactic_embedding.", "argument_selector.")
+POINTER_RANDOM_PREFIXES = (
+    "tactic_embedding.",
+    "argument_selector.",
+    "stop_head.",
+)
 
 BUNDLE_FORMAT_VERSION = 1
 
@@ -432,7 +436,13 @@ def _config_from_payload(
     *,
     model_type: str,
 ) -> BaselineConfig | PointerConfig:
-    if model_type == "pointer":
+    declared_type = payload.get("model_type")
+    if declared_type is not None and str(declared_type) != model_type:
+        raise ValueError(
+            f"Bundle config declares model_type '{declared_type}', but its manifest "
+            f"declares '{model_type}'. Refusing to load."
+        )
+    if model_type in {"pointer", "pointer_gru"}:
         return PointerConfig.from_dict(dict(payload))
     return BaselineConfig.from_dict(dict(payload))
 
@@ -564,6 +574,7 @@ def export_model_bundle(
             )
         config_payload = _read_json(sibling)
         config_source = str(sibling)
+    config_payload["model_type"] = model_type
 
     # Build the model once before writing anything. A config that disagrees with
     # its own weights must fail here, while the output directory is still empty,
@@ -574,7 +585,7 @@ def export_model_bundle(
     config = _config_from_payload(config_payload, model_type=model_type)
     probe = (
         build_pointer_model(metadata, config)
-        if model_type == "pointer"
+        if model_type in {"pointer", "pointer_gru"}
         else build_baseline_model(metadata, config)
     )
     load_state_dict_checked(probe, state_dict)
@@ -823,7 +834,7 @@ def load_model_bundle(
 
     model: nn.Module = (
         build_pointer_model(metadata, config)
-        if model_type == "pointer"
+        if model_type in {"pointer", "pointer_gru"}
         else build_baseline_model(metadata, config)
     )
     load_state_dict_checked(model, state_dict)
@@ -880,7 +891,7 @@ def load_pointer_bundle(
     manifest = read_bundle_manifest(bundle_dir)
     model_type = str(manifest["model_type"])
 
-    if model_type == "pointer":
+    if model_type in {"pointer", "pointer_gru"}:
         return load_model_bundle(bundle_dir, device=device, eval_mode=eval_mode)
 
     node_vocab, tactic_vocab = load_bundle_vocabularies(bundle_dir, manifest)

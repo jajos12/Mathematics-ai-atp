@@ -53,9 +53,8 @@ from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import (
 
 
 class StateDictModelTypeTests(unittest.TestCase):
-    def test_pointer_and_baseline_are_told_apart_by_the_backbone_prefix(self) -> None:
-        # Neither config records the model type, so the weights are the only
-        # witness: a pointer holds its baseline in self.backbone.
+    def test_legacy_pointer_and_baseline_are_told_apart_by_the_backbone_prefix(self) -> None:
+        # Legacy pointer weights have the backbone prefix but no GRU decoder.
         self.assertEqual(
             detect_state_dict_model_type({"backbone.classifier.weight": torch.zeros(2)}),
             "pointer",
@@ -63,6 +62,12 @@ class StateDictModelTypeTests(unittest.TestCase):
         self.assertEqual(
             detect_state_dict_model_type({"classifier.weight": torch.zeros(2)}),
             "baseline",
+        )
+
+    def test_detects_gru_pointer_state_dict_separately(self) -> None:
+        self.assertEqual(
+            detect_state_dict_model_type({"argument_selector.gru.weight_ih": torch.zeros(2)}),
+            "pointer_gru",
         )
 
 
@@ -530,7 +535,7 @@ class ModelBundleTests(unittest.TestCase):
     # Pointer bundles, baseline wrapping, and the scorer companion
     # ------------------------------------------------------------------
 
-    def test_a_pointer_checkpoint_round_trips_as_a_pointer_bundle(self) -> None:
+    def test_a_gru_pointer_checkpoint_round_trips_as_a_gru_pointer_bundle(self) -> None:
         checkpoint_path = self.run_root / "pointer" / "best.pt"
         _, payload = self._write_pointer_checkpoint(checkpoint_path)
 
@@ -538,7 +543,7 @@ class ModelBundleTests(unittest.TestCase):
         manifest = export_model_bundle(
             checkpoint_path=checkpoint_path, output_dir=bundle_dir
         )
-        self.assertEqual(manifest["model_type"], "pointer")
+        self.assertEqual(manifest["model_type"], "pointer_gru")
         self.assertEqual(manifest["source_epoch"], 3)
 
         self._delete_prepared_root()
@@ -551,6 +556,13 @@ class ModelBundleTests(unittest.TestCase):
                 torch.equal(expected, loaded.model.state_dict()[key]),
                 msg=f"parameter '{key}' changed across the bundle round trip",
             )
+
+    def test_legacy_pointer_model_type_remains_supported(self) -> None:
+        """The new bundle identity must not invalidate published legacy bundles."""
+        from maths_ai.gnn_inference.atp_lean_gnn.bundle import VALID_MODEL_TYPES
+
+        self.assertIn("pointer", VALID_MODEL_TYPES)
+        self.assertIn("pointer_gru", VALID_MODEL_TYPES)
 
     def test_a_baseline_bundle_is_wrapped_into_a_pointer_and_says_what_is_random(
         self,

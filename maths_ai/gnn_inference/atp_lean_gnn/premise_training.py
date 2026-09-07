@@ -15,7 +15,7 @@ from torch.optim import AdamW
 from torch_geometric.loader import DataLoader
 
 from .argument_selector import TacticWithArgsClassifier, compute_combined_loss
-from .labels import get_tactic_arity, parse_tactic_arguments
+from .labels import parse_tactic_arguments
 from .lemma_index import LemmaIndex
 from .premise_pool import build_unified_pools
 from .premise_scoring import PremiseScorer, compute_premise_ranking_loss
@@ -172,7 +172,7 @@ def train_one_epoch_with_premises(
         arg_lemma_targets = _recover_lemma_targets(
             batch, arg_targets, arg_lemma_targets, lemma_index
         )
-        tactic_arities = [get_tactic_arity(n) for n in tactic_names]
+        arg_counts = [int(value) for value in batch.arg_count.tolist()]
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -180,10 +180,10 @@ def train_one_epoch_with_premises(
             device_type=device.type, dtype=amp_dtype, enabled=use_amp
         ):
             # Forward pass through model
-            tactic_logits, arg_logits_list = model(
+            tactic_logits, arg_logits_list, stop_logits_list = model(
                 batch,
                 teacher_tactic_ids=targets,
-                tactic_names=tactic_names,
+                arg_targets=pointer_arg_targets,
             )
 
             # Combined tactic + argument loss
@@ -193,7 +193,8 @@ def train_one_epoch_with_premises(
                 targets,
                 pointer_arg_targets,
                 batch.batch,
-                tactic_arity_per_sample=tactic_arities,
+                arg_count_per_sample=arg_counts,
+                stop_logits_list=stop_logits_list,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
             )
@@ -338,21 +339,20 @@ def evaluate_model_with_premises(
         arg_lemma_targets = _recover_lemma_targets(
             batch, arg_targets, arg_lemma_targets, lemma_index
         )
-        tactic_arities = [get_tactic_arity(n) for n in tactic_names]
+        arg_counts = [int(value) for value in batch.arg_count.tolist()]
 
         with torch.amp.autocast(
             device_type=device.type, dtype=amp_dtype, enabled=use_amp
         ):
-            tactic_logits, arg_logits_list = model(
-                batch, tactic_names=tactic_names
-            )
+            tactic_logits, arg_logits_list, stop_logits_list = model(batch)
             ta_loss, ta_metrics = compute_combined_loss(
                 tactic_logits,
                 arg_logits_list,
                 targets,
                 pointer_arg_targets,
                 batch.batch,
-                tactic_arity_per_sample=tactic_arities,
+                arg_count_per_sample=arg_counts,
+                stop_logits_list=stop_logits_list,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
             )

@@ -453,6 +453,8 @@ def _new_tactic_stats() -> dict[str, object]:
         "ignored_parsed_tokens": 0,
         "categories": Counter(),
         "parse_shapes": Counter(),
+        "arg_count_distribution": Counter(),
+        "registry_disagreement_rows": 0,
     }
 
 
@@ -468,6 +470,11 @@ def _finalize_stats(stats: dict[str, object]) -> dict[str, object]:
         "ignored_parsed_tokens": int(stats["ignored_parsed_tokens"]),
         "categories": dict(sorted(categories.items())),
         "parse_shapes": dict(sorted(Counter(stats["parse_shapes"]).items())),
+        "arg_count_distribution": {
+            str(count): value
+            for count, value in sorted(Counter(stats["arg_count_distribution"]).items())
+        },
+        "registry_disagreement_rows": int(stats["registry_disagreement_rows"]),
         "local_selectable_coverage": selectable / max(expected, 1),
         "conservative_unambiguous_local_coverage": (
             unambiguous_selectable / max(expected, 1)
@@ -782,6 +789,15 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
                     if not isinstance(parse_shapes, Counter):
                         raise TypeError("Internal audit parse-shape counter is invalid.")
                     parse_shapes[str(row["parse_shape"])] += 1
+                    arg_count_value = _tensor_values(data, "arg_count")
+                    arg_count = arg_count_value[0] if arg_count_value else len(
+                        _tensor_values(data, "arg_node_indices")
+                    )
+                    target["arg_count_distribution"][arg_count] += 1
+                    if arg_count != int(row["expected_arity"]):
+                        target["registry_disagreement_rows"] = int(
+                            target["registry_disagreement_rows"]
+                        ) + 1
 
                 for record in records:
                     category = str(record["category"])

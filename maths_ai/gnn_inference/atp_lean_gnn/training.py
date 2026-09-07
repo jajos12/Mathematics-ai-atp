@@ -288,6 +288,7 @@ class PointerConfig:
                 arg_loss_weight=float(model_payload.get("arg_loss_weight", 0.5)),
                 heads=int(model_payload.get("heads", 8)),
                 readout=str(model_payload.get("readout", "state")),
+                teacher_forcing=bool(model_payload.get("teacher_forcing", True)),
             ),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
@@ -384,6 +385,7 @@ class PointerConfig:
                 arg_loss_weight=self.model.arg_loss_weight,
                 heads=self.model.heads,
                 readout=readout,
+                teacher_forcing=self.model.teacher_forcing,
             ),
             training=self.training,
         )
@@ -1234,17 +1236,20 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
         gnn_type=config.gnn_type,
         heads=config.model.heads,
         readout=config.model.readout,
+        teacher_forcing=config.model.teacher_forcing,
     )
 
 
 def detect_state_dict_model_type(state_dict: Mapping[str, Any]) -> str:
-    """Return ``"pointer"`` or ``"baseline"`` for a checkpoint's weights.
+    """Return the architecture identity encoded by a checkpoint's weights.
 
     Neither ``BaselineConfig.to_dict`` nor ``PointerConfig.to_dict`` records the
     model type, so the weights are the only reliable witness.  A
     ``TacticWithArgsClassifier`` holds its baseline in ``self.backbone``, so that
     prefix is present in a pointer state dict and absent from a baseline one.
     """
+    if any(str(key).startswith("argument_selector.gru.") for key in state_dict):
+        return "pointer_gru"
     if any(str(key).startswith("backbone.") for key in state_dict):
         return "pointer"
     return "baseline"

@@ -13,7 +13,6 @@ from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
 from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
-from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
 from .premise_pool import build_unified_pools
@@ -27,9 +26,8 @@ from .training import transform_edge_index
 _FRESH_NAME_TACTICS = frozenset({"intro", "rintro", "introV2"})
 # Local only: accept only local context nodes, reject library lemmas
 _LOCAL_ONLY_TACTICS = frozenset({"cases", "rcases", "rcases_pattern", "obtain"})
-# No arguments needed
-_NO_ARGS_TACTICS = frozenset({"constructor", "assumption", "trivial", "omega", "decide", "rfl", "sorry"})
-# Everything else (exact, apply, refine, rw, simp, ...): accept unified pool
+# All non-fresh tactics decode against the unified pool; the stop head handles
+# actions whose learned sequence length is zero.
 
 
 _FV_LABEL_RE = re.compile(r"^FV(\d+)$")
@@ -277,20 +275,6 @@ class InferencePipeline:
         for candidate in top_candidates:
             tactic_id = int(candidate["tactic_id"])
             tactic_name = str(candidate["tactic_name"])
-            arity = get_tactic_arity(tactic_name)
-
-            if arity == 0 or tactic_name in _NO_ARGS_TACTICS:
-                top_tactic_predictions.append(
-                    {
-                        "tactic_id": tactic_id,
-                        "tactic_name": tactic_name,
-                        "probability": float(candidate["probability"]),
-                        "selected_arguments": [],
-                        "selected_argument_details": [],
-                    }
-                )
-                continue
-
             tactic_id_tensor = torch.tensor([tactic_id], dtype=torch.long, device=self.device)
             tactic_emb = self.model.tactic_embedding(tactic_id_tensor)
 
@@ -323,60 +307,56 @@ class InferencePipeline:
                 )
                 continue
 
-            if tactic_name in _LOCAL_ONLY_TACTICS:
-                local_mask = torch.tensor(
-                    [src == "local" for src in pool.candidate_sources], device=self.device
-                )
-                if local_mask.any():
-                    local_vectors = pool.candidate_vectors[local_mask]
-                    local_scores = self.scorer.score(
-                        state_emb.squeeze(0), tactic_emb.squeeze(0), local_vectors
-                    )
-                    local_sorted = local_scores.argsort(descending=True)[:arity]
-                    local_indices = torch.where(local_mask)[0][local_sorted]
-                else:
-                    local_indices = torch.tensor([], dtype=torch.long, device=self.device)
-
-                arguments: list[str] = []
-                selected_argument_details: list[ArgumentPrediction] = []
-                for rank, idx in enumerate(local_indices.tolist()):
-                    idx = int(idx)
-                    cid = pool.candidate_ids[idx]
-                    node = dag.nodes[cid]
-                    arg_str = _resolve_local_node_name(node, dag, local_names)
-                    arguments.append(arg_str)
-                    score_val = float(local_scores[local_sorted[rank]].item()) if len(local_indices) > 0 else 0.0
-                    selected_argument_details.append(
-                        ArgumentPrediction(
-                            source="local",
-                            candidate_id=cid,
-                            label=arg_str,
-                            score=score_val,
-                        )
-                    )
-
+            candidate_mask = torch.tensor(
+                [src == "local" for src in pool.candidate_sources],
+                device=self.device,
+                dtype=torch.bool,
+            ) if tactic_name in _LOCAL_ONLY_TACTICS else torch.ones(
+                len(pool.candidate_ids), device=self.device, dtype=torch.bool
+            )
+            candidate_indices = torch.where(candidate_mask)[0]
+            if candidate_indices.numel() == 0:
                 top_tactic_predictions.append(
                     {
                         "tactic_id": tactic_id,
                         "tactic_name": tactic_name,
                         "probability": float(candidate["probability"]),
-                        "selected_arguments": arguments,
-                        "selected_argument_details": selected_argument_details,
+                        "selected_arguments": [],
+                        "selected_argument_details": [],
                     }
                 )
                 continue
-
-            # ── Default: unified pool scoring (exact, apply, rw, simp, ...) ──
-            scores = self.scorer.score(state_emb.squeeze(0), tactic_emb.squeeze(0), pool.candidate_vectors)
-            sorted_indices = scores.argsort(descending=True)
-            top_indices = sorted_indices[:arity].tolist()
+            candidate_vectors = pool.candidate_vectors[candidate_indices]
+            decoder_state = self.model.argument_selector.initial_state(state_emb, tactic_emb)
+            selected_positions = torch.zeros(
+                candidate_vectors.size(0), dtype=torch.bool, device=self.device
+            )
+            top_indices: list[int] = []
+            selected_scores: list[float] = []
+            for step in range(self.model.max_args + 1):
+                if float(self.model.stop_head(decoder_state).item()) >= 0:
+                    break
+                if step == self.model.max_args:
+                    break
+                scores = self.model.argument_selector.score_candidates(
+                    decoder_state, candidate_vectors
+                )
+                scores = scores.masked_fill(selected_positions, float("-inf"))
+                selected_position = int(scores.argmax().item())
+                selected_score = float(scores[selected_position].item())
+                selected_positions[selected_position] = True
+                top_indices.append(int(candidate_indices[selected_position].item()))
+                selected_scores.append(selected_score)
+                selected_embedding = candidate_vectors[selected_position].unsqueeze(0)
+                decoder_state = self.model.argument_selector.gru(
+                    selected_embedding, decoder_state
+                )
 
             arguments = []
             selected_argument_details = []
-            for idx in top_indices:
+            for idx, score_value in zip(top_indices, selected_scores):
                 source = pool.candidate_sources[idx]
                 cid = pool.candidate_ids[idx]
-                score_value = float(scores[idx].item())
 
                 if source == "local":
                     node = dag.nodes[cid]

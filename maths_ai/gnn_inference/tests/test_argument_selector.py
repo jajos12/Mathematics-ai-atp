@@ -148,9 +148,10 @@ class ArgumentSelectorTests(unittest.TestCase):
         scores1, sel1 = selector(
             state_emb, tactic_emb, node_embeddings, premise_mask, batch_index
         )
+        state2 = selector.initial_state(state_emb, tactic_emb)
         scores2, sel2 = selector(
             state_emb, tactic_emb, node_embeddings, premise_mask, batch_index,
-            prev_arg_emb=sel1,
+            decoder_state=selector.gru(sel1, state2),
         )
 
         # Scores should differ because the query context changed
@@ -158,6 +159,21 @@ class ArgumentSelectorTests(unittest.TestCase):
             torch.allclose(scores1, scores2),
             "Autoregressive step should produce different scores",
         )
+
+    def test_repeat_positions_are_suppressed(self) -> None:
+        selector = ArgumentSelector(8)
+        state = torch.randn(1, 8)
+        tactic = torch.randn(1, 8)
+        nodes = torch.randn(3, 8)
+        batch_index = torch.zeros(3, dtype=torch.long)
+        mask = torch.ones(3, dtype=torch.bool)
+        excluded = torch.tensor([[True, False, False]])
+
+        scores, _ = selector(
+            state, tactic, nodes, mask, batch_index,
+            excluded_positions=excluded,
+        )
+        self.assertTrue(torch.isneginf(scores[0, 0]))
 
 
 class TacticWithArgsClassifierTests(unittest.TestCase):
@@ -201,14 +217,15 @@ class TacticWithArgsClassifierTests(unittest.TestCase):
             max_args=2,
         )
 
-        tactic_logits, arg_logits_list = model(
+        tactic_logits, arg_logits_list, stop_logits_list = model(
             batch,
             teacher_tactic_ids=batch.y.view(-1),
-            tactic_names=["apply", "apply"],
+            arg_targets=torch.tensor([[0], [5]], dtype=torch.long),
         )
 
         self.assertEqual(tactic_logits.shape, (2, 5))
-        self.assertGreater(len(arg_logits_list), 0)
+        self.assertEqual(len(arg_logits_list), 2)
+        self.assertEqual(len(stop_logits_list), 3)
         for arg_logits in arg_logits_list:
             self.assertEqual(arg_logits.shape[0], 2)
 
@@ -224,17 +241,75 @@ class TacticWithArgsClassifierTests(unittest.TestCase):
             max_args=2,
         )
 
-        tactic_logits, arg_logits_list = model(
+        tactic_logits, arg_logits_list, stop_logits_list = model(
             batch,
             teacher_tactic_ids=batch.y.view(-1),
-            tactic_names=["simp", "simp"],
         )
 
         self.assertEqual(tactic_logits.shape, (2, 5))
-        self.assertEqual(len(arg_logits_list), 0)
+        self.assertEqual(len(arg_logits_list), 2)
+        self.assertEqual(len(stop_logits_list), 3)
+
+    def test_three_argument_decode_is_representable(self) -> None:
+        batch, vocab = self._build_tiny_batch()
+        model = TacticWithArgsClassifier(
+            num_node_labels=len(vocab), num_tactics=5, hidden_dim=16,
+            num_layers=2, max_args=3,
+        )
+        _, arg_logits_list, stop_logits_list = model(
+            batch,
+            teacher_tactic_ids=batch.y.view(-1),
+            arg_targets=torch.tensor([[0, 1, 2], [5, 6, 7]], dtype=torch.long),
+        )
+        self.assertEqual(len(arg_logits_list), 3)
+        self.assertEqual(len(stop_logits_list), 4)
 
 
 class CombinedLossTests(unittest.TestCase):
+    def test_loss_uses_corpus_counts_not_registry_arity(self) -> None:
+        tactic_logits = torch.randn(3, 4, requires_grad=True)
+        arg_logits = [
+            torch.randn(3, 6, requires_grad=True),
+            torch.randn(3, 6, requires_grad=True),
+            torch.randn(3, 6, requires_grad=True),
+        ]
+        stop_logits = [torch.randn(3, requires_grad=True) for _ in range(3)]
+        targets = torch.tensor([[0, -1, -1], [1, 2, -1], [3, 4, 5]])
+        batch_index = torch.cat([
+            torch.zeros(2, dtype=torch.long),
+            torch.ones(2, dtype=torch.long),
+            torch.full((2,), 2, dtype=torch.long),
+        ])
+
+        _, metrics = compute_combined_loss(
+            tactic_logits,
+            arg_logits,
+            torch.tensor([1, 1, 1]),
+            targets,
+            batch_index,
+            arg_count_per_sample=[0, 1, 3],
+            stop_logits_list=stop_logits,
+        )
+
+        self.assertEqual(metrics["arg_target_count"], 4)
+        self.assertEqual(metrics["arg_truncated_count"], 0)
+
+    def test_targets_beyond_max_args_are_reported(self) -> None:
+        tactic_logits = torch.randn(1, 4, requires_grad=True)
+        arg_logits = [torch.randn(1, 6, requires_grad=True) for _ in range(2)]
+        _, metrics = compute_combined_loss(
+            tactic_logits,
+            arg_logits,
+            torch.tensor([1]),
+            torch.tensor([[0, 1]]),
+            torch.zeros(2, dtype=torch.long),
+            arg_count_per_sample=[3],
+        )
+
+        self.assertEqual(metrics["arg_target_count"], 3)
+        self.assertEqual(metrics["arg_truncated_count"], 1)
+        self.assertEqual(metrics["arg_truncated_examples"], 1)
+
     def test_masks_invalid_arg_targets(self) -> None:
         batch_size = 2
         num_tactics = 5
@@ -255,7 +330,7 @@ class CombinedLossTests(unittest.TestCase):
             tactic_targets,
             arg_targets,
             batch_index,
-            tactic_arity_per_sample=[1, 1],
+            arg_count_per_sample=[1, 1],
             arg_loss_weight=0.5,
             unknown_tactic_id=0,
         )
@@ -288,7 +363,7 @@ class CombinedLossTests(unittest.TestCase):
             tactic_targets,
             torch.tensor([[-1], [-1]], dtype=torch.long),
             batch_index,
-            tactic_arity_per_sample=[0, 0],
+            arg_count_per_sample=[0, 0],
             arg_loss_weight=0.5,
             unknown_tactic_id=0,
         )

@@ -13,7 +13,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .labels import get_tactic_arity
 from .model import GATv2StateClassifier, GraphSAGEStateClassifier
 from .pyg import NODE_TYPE_TO_ID
 
@@ -35,11 +34,18 @@ class ArgumentSelector(nn.Module):
 
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
-        # First step: query is [state_emb; tactic_emb] → hidden_dim
-        self.query_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        # Subsequent steps: query is [state_emb; tactic_emb; prev_arg_emb] → hidden_dim
-        self.query_proj_ar = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.init_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         self._scale = 1.0 / math.sqrt(hidden_dim)
+
+    def initial_state(self, state_emb: Tensor, tactic_emb: Tensor) -> Tensor:
+        return torch.tanh(self.init_proj(torch.cat([state_emb, tactic_emb], dim=1)))
+
+    def score_candidates(self, decoder_state: Tensor, candidate_embeddings: Tensor) -> Tensor:
+        """Score one candidate pool for a batch of decoder states."""
+        query = self.out_proj(decoder_state)
+        return (candidate_embeddings @ query.unsqueeze(-1)).squeeze(-1) * self._scale
 
     def forward(
         self,
@@ -48,7 +54,8 @@ class ArgumentSelector(nn.Module):
         node_embeddings: Tensor,   # [total_nodes, H]
         premise_mask: Tensor,      # [total_nodes]  bool
         batch_index: Tensor,       # [total_nodes]  → which graph each node belongs to
-        prev_arg_emb: Tensor | None = None,  # [B, H] or None
+        decoder_state: Tensor | None = None,
+        excluded_positions: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Return ``(arg_logits, selected_emb)``.
 
@@ -61,12 +68,9 @@ class ArgumentSelector(nn.Module):
         device = state_emb.device
 
         # --- 1. Build the query vector --------------------------------
-        if prev_arg_emb is None:
-            query = self.query_proj(torch.cat([state_emb, tactic_emb], dim=1))  # [B, H]
-        else:
-            query = self.query_proj_ar(
-                torch.cat([state_emb, tactic_emb, prev_arg_emb], dim=1)
-            )  # [B, H]
+        if decoder_state is None:
+            decoder_state = self.initial_state(state_emb, tactic_emb)
+        query = self.out_proj(decoder_state)
 
         # --- 2. Scatter node embeddings into a padded [B, N_max, H] tensor -
         #     where N_max is the max number of nodes in any graph in the batch.
@@ -97,6 +101,8 @@ class ArgumentSelector(nn.Module):
 
         # Mask out non-premise positions
         scores = scores.masked_fill(~padded_mask, float("-inf"))
+        if excluded_positions is not None:
+            scores = scores.masked_fill(excluded_positions, float("-inf"))
 
         # --- 4. Selected node embedding for autoregressive context ----
         with torch.no_grad():
@@ -121,6 +127,7 @@ class TacticWithArgsConfig:
     arg_loss_weight: float = 0.5
     heads: int = 8
     readout: str = "state"
+    teacher_forcing: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -131,6 +138,7 @@ class TacticWithArgsConfig:
             "arg_loss_weight": self.arg_loss_weight,
             "heads": self.heads,
             "readout": self.readout,
+            "teacher_forcing": self.teacher_forcing,
         }
 
 
@@ -157,6 +165,7 @@ class TacticWithArgsClassifier(nn.Module):
         gnn_type: str = "sage",
         heads: int = 8,
         readout: str = "state",
+        teacher_forcing: bool = True,
     ) -> None:
         super().__init__()
 
@@ -187,6 +196,8 @@ class TacticWithArgsClassifier(nn.Module):
 
         self.max_args = max_args
         self.hidden_dim = hidden_dim
+        self.teacher_forcing = teacher_forcing
+        self.stop_head = nn.Linear(hidden_dim, 1)
 
     # ---- convenience accessors for the backbone ----
     @property
@@ -202,9 +213,9 @@ class TacticWithArgsClassifier(nn.Module):
         data,
         *,
         teacher_tactic_ids: Tensor | None = None,
-        tactic_names: list[str] | None = None,
-    ) -> tuple[Tensor, list[Tensor]]:
-        """Return ``(tactic_logits, arg_logits_list)``.
+        arg_targets: Tensor | None = None,
+    ) -> tuple[Tensor, list[Tensor], list[Tensor]]:
+        """Return tactic logits, argument logits, and stop logits.
 
         Parameters
         ----------
@@ -214,9 +225,8 @@ class TacticWithArgsClassifier(nn.Module):
         teacher_tactic_ids : Tensor, optional
             Ground-truth tactic ids for teacher-forcing during training.
             Shape ``[B]``.
-        tactic_names : list[str], optional
-            Tactic family names per sample (used to look up arity).
-            If not provided the model uses ``max_args`` for every sample.
+        arg_targets : Tensor, optional
+            Global node indices used for teacher forcing, shaped ``[B, max_args]``.
 
         Returns
         -------
@@ -244,17 +254,8 @@ class TacticWithArgsClassifier(nn.Module):
 
         tactic_emb = self.tactic_embedding(tactic_ids)  # [B, H]
 
-        # 5. Determine how many argument steps to run
-        if tactic_names is not None:
-            n_steps = max(get_tactic_arity(name) for name in tactic_names)
-            n_steps = min(n_steps, self.max_args)
-        else:
-            n_steps = self.max_args
-
-        if n_steps == 0:
-            return tactic_logits, []
-
-        # Autoregressive argument selection using the cached premise mask
+        # 5. Always expose the bounded decoder positions. The stop head,
+        # supervised by each sample's arg_count, controls the sequence length.
         if hasattr(data, "premise_mask") and data.premise_mask is not None:
             premise_mask = data.premise_mask.to(device=node_embeddings.device)
         else:
@@ -264,17 +265,49 @@ class TacticWithArgsClassifier(nn.Module):
         batch_index = data.batch.to(device=node_embeddings.device)
 
         arg_logits_list: list[Tensor] = []
-        prev_arg_emb: Tensor | None = None
+        stop_logits_list: list[Tensor] = []
+        decoder_state = self.argument_selector.initial_state(state_emb, tactic_emb)
+        counts = torch.bincount(batch_index, minlength=state_emb.size(0))
+        max_nodes = int(counts.max().item())
+        excluded_positions = torch.zeros(
+            state_emb.size(0), max_nodes, dtype=torch.bool, device=node_embeddings.device
+        )
+        node_offsets = torch.zeros_like(batch_index)
+        for graph_index in range(state_emb.size(0)):
+            graph_mask = batch_index == graph_index
+            node_offsets[graph_mask] = torch.arange(
+                int(graph_mask.sum().item()), device=node_embeddings.device
+            )
 
-        for _ in range(n_steps):
+        for step in range(self.max_args + 1):
+            stop_logits_list.append(self.stop_head(decoder_state).squeeze(-1))
+            if step == self.max_args:
+                break
             scores, selected_emb = self.argument_selector(
                 state_emb, tactic_emb, node_embeddings, premise_mask, batch_index,
-                prev_arg_emb=prev_arg_emb,
+                decoder_state=decoder_state,
+                excluded_positions=excluded_positions,
             )
             arg_logits_list.append(scores)
-            prev_arg_emb = selected_emb
 
-        return tactic_logits, arg_logits_list
+            if self.teacher_forcing and arg_targets is not None and step < arg_targets.size(1):
+                previous_indices = arg_targets[:, step]
+                valid = previous_indices >= 0
+                next_input = torch.zeros_like(selected_emb)
+                if valid.any():
+                    next_input[valid] = node_embeddings[previous_indices[valid]]
+                    graph_ids = torch.arange(
+                        state_emb.size(0), device=node_embeddings.device
+                    )[valid]
+                    excluded_positions[graph_ids, node_offsets[previous_indices[valid]]] = True
+            else:
+                next_input = selected_emb
+                with torch.no_grad():
+                    selected_positions = scores.argmax(dim=1)
+                    excluded_positions.scatter_(1, selected_positions.unsqueeze(1), True)
+            decoder_state = self.argument_selector.gru(next_input, decoder_state)
+
+        return tactic_logits, arg_logits_list, stop_logits_list
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +356,14 @@ def compute_combined_loss(
     arg_targets: Tensor,
     batch_index: Tensor,
     *,
-    tactic_arity_per_sample: list[int],
+    arg_count_per_sample: list[int],
+    stop_logits_list: list[Tensor] | None = None,
     arg_loss_weight: float = 0.5,
     unknown_tactic_id: int = 0,
     node_labels: Tensor | None = None,
     node_types: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float | int]]:
-    """Tactic classification loss + masked argument selection loss."""
+    """Tactic classification, sequence argument, and stop-decision loss."""
     device = tactic_logits.device
     batch_size = tactic_logits.size(0)
 
@@ -351,6 +385,13 @@ def compute_combined_loss(
             "arg_top1_accuracy": 0.0,
             "arg_top5_accuracy": 0.0,
             "arg_target_coverage": 0.0,
+            "arg_exact_sequence_correct": 0,
+            "arg_sequence_count": 0,
+            "arg_exact_sequence_flags": [],
+            "arg_position_top1_accuracy": 0.0,
+            "arg_position_top5_accuracy": 0.0,
+            "stop_loss": 0.0,
+            "stop_accuracy": 0.0,
         }
 
     padded_targets = resolve_arg_targets_to_padded(
@@ -361,7 +402,10 @@ def compute_combined_loss(
     arg_top1_correct = 0
     arg_top5_correct = 0
     arg_valid_count = 0
-    arg_target_count = 0
+    arg_target_count = sum(arg_count_per_sample)
+    exact_sequence_correct = 0
+    sequence_count = batch_size
+    exact_sequence_flags = [0] * batch_size
     for step_k, arg_logits_k in enumerate(arg_logits_list):
         if step_k >= padded_targets.size(1):
             break
@@ -369,10 +413,8 @@ def compute_combined_loss(
         gt_k = padded_targets[:, step_k]  # [B]
         valid = gt_k >= 0
         for b_idx in range(batch_size):
-            if tactic_arity_per_sample[b_idx] <= step_k:
+            if arg_count_per_sample[b_idx] <= step_k:
                 valid[b_idx] = False
-            else:
-                arg_target_count += 1
             if valid[b_idx]:
                 # Skip target if it was masked out by premise_mask
                 if torch.isneginf(arg_logits_k[b_idx, gt_k[b_idx]]):
@@ -397,7 +439,41 @@ def compute_combined_loss(
     else:
         arg_loss = torch.tensor(0.0, device=device)
 
-    total_loss = tactic_loss + arg_loss_weight * arg_loss
+    stop_loss = torch.tensor(0.0, device=device)
+    stop_correct = 0
+    stop_count = 0
+    if stop_logits_list:
+        stop_targets = torch.tensor(
+            [[step >= count for step in range(len(stop_logits_list))]
+             for count in arg_count_per_sample],
+            device=device,
+            dtype=torch.float32,
+        )
+        stop_logits = torch.stack(stop_logits_list, dim=1)
+        stop_loss = F.binary_cross_entropy_with_logits(stop_logits, stop_targets)
+        stop_correct = int(((stop_logits >= 0) == stop_targets.bool()).sum().item())
+        stop_count = int(stop_targets.numel())
+
+        for sample_index, target_count in enumerate(arg_count_per_sample):
+            predicted_count = len(stop_logits_list)
+            for step_index, stop_logit in enumerate(stop_logits_list):
+                if stop_logit[sample_index] >= 0:
+                    predicted_count = step_index
+                    break
+            target_sequence = [
+                int(padded_targets[sample_index, step].item())
+                for step in range(min(target_count, padded_targets.size(1)))
+                if padded_targets[sample_index, step] >= 0
+            ]
+            predicted_sequence = [
+                int(arg_logits_list[step][sample_index].argmax().item())
+                for step in range(min(predicted_count, len(arg_logits_list)))
+            ]
+            if predicted_sequence == target_sequence and target_count <= len(arg_logits_list):
+                exact_sequence_correct += 1
+                exact_sequence_flags[sample_index] = 1
+
+    total_loss = tactic_loss + arg_loss_weight * (arg_loss + stop_loss)
     return total_loss, {
         "tactic_loss": float(tactic_loss.item()),
         "arg_loss": float(arg_loss.item()),
@@ -409,4 +485,17 @@ def compute_combined_loss(
         "arg_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
         "arg_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
         "arg_target_coverage": arg_valid_count / max(arg_target_count, 1),
+        "arg_exact_sequence_correct": exact_sequence_correct,
+        "arg_sequence_count": sequence_count,
+        "arg_exact_sequence_flags": exact_sequence_flags,
+        "arg_position_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
+        "arg_position_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
+        "arg_truncated_count": sum(
+            max(count - len(arg_logits_list), 0) for count in arg_count_per_sample
+        ),
+        "arg_truncated_examples": sum(
+            count > len(arg_logits_list) for count in arg_count_per_sample
+        ),
+        "stop_loss": float(stop_loss.item()),
+        "stop_accuracy": stop_correct / max(stop_count, 1),
     }

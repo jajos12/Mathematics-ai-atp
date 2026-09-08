@@ -334,6 +334,9 @@ class CombinedLossTests(unittest.TestCase):
 
         self.assertEqual(metrics["arg_target_count"], 4)
         self.assertEqual(metrics["arg_truncated_count"], 0)
+        # Denominator counts only DAG-node targets within the decode budget;
+        # the -1 lemma positions never enter it.
+        self.assertEqual(metrics["arg_lemma_position_count"], 0)
 
     def test_targets_beyond_max_args_are_reported(self) -> None:
         tactic_logits = torch.randn(1, 4, requires_grad=True)
@@ -347,9 +350,37 @@ class CombinedLossTests(unittest.TestCase):
             arg_count_per_sample=[3],
         )
 
-        self.assertEqual(metrics["arg_target_count"], 3)
+        # Only the two node targets within the decode budget are scoreable;
+        # the third position is truncated, not counted as a missed target.
+        self.assertEqual(metrics["arg_target_count"], 2)
         self.assertEqual(metrics["arg_truncated_count"], 1)
         self.assertEqual(metrics["arg_truncated_examples"], 1)
+
+    def test_lemma_positions_do_not_inflate_the_coverage_denominator(self) -> None:
+        """Lemma citations are the scorer's population, not the pointer's.
+
+        Stored as -1 node indices, they must be excluded from
+        arg_target_count and reported separately, so coverage measures the
+        model rather than the corpus's citation density.
+        """
+        tactic_logits = torch.randn(2, 4, requires_grad=True)
+        arg_logits = [torch.randn(2, 6, requires_grad=True) for _ in range(2)]
+        # Sample 0: two node targets then a lemma citation (-1).
+        # Sample 1: one node target, one lemma citation, one truncated.
+        targets = torch.tensor([[0, 1, -1], [2, -1, 3]])
+        _, metrics = compute_combined_loss(
+            tactic_logits,
+            arg_logits,
+            torch.tensor([1, 1]),
+            targets,
+            torch.cat([torch.zeros(3, dtype=torch.long), torch.ones(3, dtype=torch.long)]),
+            arg_count_per_sample=[3, 3],
+        )
+        # Decode budget is 2 steps: 2 + 1 in-budget node targets.
+        self.assertEqual(metrics["arg_target_count"], 3)
+        # Sample 0's step-2 lemma and sample 1's step-1 lemma are both past
+        # the decode budget or unresolvable node indices.
+        self.assertEqual(metrics["arg_lemma_position_count"], 1)
 
     def test_truncated_samples_stop_target_clamps_to_the_last_step(self) -> None:
         """arg_count > max_args must supervise "stop" at the final position.
@@ -463,8 +494,14 @@ class CombinedLossTests(unittest.TestCase):
         self.assertIn("tactic_loss", metrics)
         self.assertIn("arg_loss", metrics)
         self.assertEqual(metrics["arg_valid_count"], 1)
-        self.assertEqual(metrics["arg_target_count"], 2)
-        self.assertEqual(metrics["arg_target_coverage"], 0.5)
+        # The second sample's target is -1 (token resolved to no node), which
+        # is not a scoreable target under the honest denominator: coverage is
+        # over targets the pointer could have been scored on, and an
+        # unresolvable token never enters it.  A premise-masked target (>= 0
+        # but -inf logits) does stay in the denominator so masking regressions
+        # surface as coverage < 1.
+        self.assertEqual(metrics["arg_target_count"], 1)
+        self.assertEqual(metrics["arg_target_coverage"], 1.0)
         self.assertIn("arg_top1_accuracy", metrics)
         self.assertIn("arg_top5_accuracy", metrics)
 

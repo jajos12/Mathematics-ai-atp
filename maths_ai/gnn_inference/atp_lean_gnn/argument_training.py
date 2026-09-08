@@ -202,6 +202,8 @@ def evaluate_model_with_args(
     arg_top5_correct = 0
     arg_valid_count = 0
     arg_target_count = 0
+    arg_lemma_position_count = 0
+    arg_truncated_count = 0
     exact_sequence_correct = 0
     sequence_count = 0
     stop_correct = 0.0
@@ -264,6 +266,8 @@ def evaluate_model_with_args(
         arg_top5_correct += int(metrics.get("arg_top5_correct", 0))
         arg_valid_count += int(metrics.get("arg_valid_count", 0))
         arg_target_count += int(metrics.get("arg_target_count", 0))
+        arg_lemma_position_count += int(metrics.get("arg_lemma_position_count", 0))
+        arg_truncated_count += int(metrics.get("arg_truncated_count", 0))
         exact_sequence_correct += int(metrics.get("arg_exact_sequence_correct", 0))
         sequence_count += int(metrics.get("arg_sequence_count", bs))
         oracle_exact_sequence_correct += int(
@@ -318,6 +322,8 @@ def evaluate_model_with_args(
         "arg_valid_count": arg_valid_count,
         "arg_target_count": arg_target_count,
         "arg_target_coverage": arg_valid_count / max(arg_target_count, 1),
+        "arg_lemma_position_count": arg_lemma_position_count,
+        "arg_truncated_count": arg_truncated_count,
         "arg_exact_sequence_accuracy": exact_sequence_correct / max(sequence_count, 1),
         "arg_exact_sequence_accuracy_oracle_tactic": oracle_exact_sequence_correct / max(oracle_sequence_count, 1),
         "arg_exact_sequence_accuracy_predicted_tactic": exact_sequence_correct / max(sequence_count, 1),

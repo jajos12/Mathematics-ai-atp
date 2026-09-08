@@ -404,6 +404,9 @@ def compute_combined_loss(
             "arg_exact_sequence_flags": [],
             "arg_position_top1_accuracy": 0.0,
             "arg_position_top5_accuracy": 0.0,
+            "arg_lemma_position_count": 0,
+            "arg_truncated_count": 0,
+            "arg_truncated_examples": 0,
             "stop_loss": 0.0,
             "stop_accuracy": 0.0,
         }
@@ -416,7 +419,25 @@ def compute_combined_loss(
     arg_top1_correct = 0
     arg_top5_correct = 0
     arg_valid_count = 0
-    arg_target_count = sum(arg_count_per_sample)
+    # Only positions the pointer can actually be scored on belong in the
+    # coverage denominator: a DAG node target at a step inside both the
+    # sample's arg_count and the decoder's step budget.  Lemma citations are
+    # stored as -1 node indices (the scorer's population, not the pointer's)
+    # and positions past max_args are physically undecodable -- counting
+    # either makes the metric measure the corpus composition instead of the
+    # model.  The old denominator summed every sample's raw arg_count, lemma
+    # positions and all.
+    decode_budget = len(arg_logits_list)
+    arg_target_count = 0
+    arg_lemma_position_count = 0
+    for b in range(batch_size):
+        count = min(arg_count_per_sample[b], decode_budget)
+        for step in range(min(count, arg_targets.size(1))):
+            if int(arg_targets[b, step].item()) >= 0:
+                arg_target_count += 1
+        for step in range(arg_targets.size(1)):
+            if int(arg_targets[b, step].item()) >= 0 and step >= decode_budget:
+                arg_lemma_position_count += 1
     exact_sequence_correct = 0
     sequence_count = batch_size
     exact_sequence_flags = [0] * batch_size
@@ -531,6 +552,7 @@ def compute_combined_loss(
         "arg_exact_sequence_flags": exact_sequence_flags,
         "arg_position_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
         "arg_position_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
+        "arg_lemma_position_count": arg_lemma_position_count,
         "arg_truncated_count": sum(
             max(count - len(arg_logits_list), 0) for count in arg_count_per_sample
         ),

@@ -290,6 +290,12 @@ class TacticWithArgsClassifier(nn.Module):
             )
             arg_logits_list.append(scores)
 
+            # The exclusion mask must accumulate out-of-place: masked_fill
+            # saves the tensor it was handed for backward, so mutating it in
+            # place before the backward pass bumps its version and autograd
+            # aborts on the second decode step.  Building a fresh mask and
+            # OR-ing keeps every step's saved tensor frozen at the version it
+            # was read at.
             if self.teacher_forcing and arg_targets is not None and step < arg_targets.size(1):
                 previous_indices = arg_targets[:, step]
                 valid = previous_indices >= 0
@@ -299,12 +305,20 @@ class TacticWithArgsClassifier(nn.Module):
                     graph_ids = torch.arange(
                         state_emb.size(0), device=node_embeddings.device
                     )[valid]
-                    excluded_positions[graph_ids, node_offsets[previous_indices[valid]]] = True
+                    step_excluded = torch.zeros_like(excluded_positions)
+                    step_excluded[
+                        graph_ids, node_offsets[previous_indices[valid]]
+                    ] = True
+                    excluded_positions = excluded_positions | step_excluded
+                else:
+                    pass
             else:
                 next_input = selected_emb
                 with torch.no_grad():
                     selected_positions = scores.argmax(dim=1)
-                    excluded_positions.scatter_(1, selected_positions.unsqueeze(1), True)
+                    step_excluded = torch.zeros_like(excluded_positions)
+                    step_excluded.scatter_(1, selected_positions.unsqueeze(1), True)
+                    excluded_positions = excluded_positions | step_excluded
             decoder_state = self.argument_selector.gru(next_input, decoder_state)
 
         return tactic_logits, arg_logits_list, stop_logits_list

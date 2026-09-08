@@ -222,7 +222,6 @@ class TacticWithArgsClassifierTests(unittest.TestCase):
             teacher_tactic_ids=batch.y.view(-1),
             arg_targets=torch.tensor([[0], [5]], dtype=torch.long),
         )
-
         self.assertEqual(tactic_logits.shape, (2, 5))
         self.assertEqual(len(arg_logits_list), 2)
         self.assertEqual(len(stop_logits_list), 3)
@@ -263,6 +262,48 @@ class TacticWithArgsClassifierTests(unittest.TestCase):
         )
         self.assertEqual(len(arg_logits_list), 3)
         self.assertEqual(len(stop_logits_list), 4)
+
+    def test_backward_through_multi_step_teacher_forcing(self) -> None:
+        """A backward pass through the recurrent loop must not hit autograd.
+
+        The exclusion mask is consumed by masked_fill at every decode step,
+        and masked_fill saves its mask for backward.  Mutating that mask in
+        place between steps bumps its version, so autograd aborts on the
+        second step with "modified by an inplace operation" -- a defect the
+        forward-only tests cannot see.  The mask must accumulate out-of-place.
+        """
+        batch, vocab = self._build_tiny_batch()
+        model = TacticWithArgsClassifier(
+            num_node_labels=len(vocab), num_tactics=5, hidden_dim=16,
+            num_layers=2, max_args=3,
+        )
+        n_per_graph = int(batch.ptr[1].item())
+        # Global-index targets across two graphs, forcing the mask to update
+        # after every step while gradients are being recorded.
+        arg_targets = torch.tensor(
+            [[0, 1, -1], [n_per_graph, n_per_graph + 1, -1]], dtype=torch.long
+        )
+        tactic_logits, arg_logits_list, stop_logits_list = model(
+            batch,
+            teacher_tactic_ids=batch.y.view(-1),
+            arg_targets=arg_targets,
+        )
+        self.assertEqual(len(arg_logits_list), 3)
+
+        loss = tactic_logits.sum()
+        for scores in arg_logits_list:
+            # clamp keeps the -inf masked positions out of the sum's gradient
+            loss = loss + scores.clamp(min=-1e4).sum()
+        for stop_logits in stop_logits_list:
+            loss = loss + stop_logits.sum()
+        loss.backward()  # must not raise
+
+        # Gradients reached the decoder parameters, not just the backbone.
+        self.assertIsNotNone(model.argument_selector.gru.weight_ih.grad)
+        self.assertTrue(
+            model.argument_selector.gru.weight_ih.grad.abs().sum().item() > 0
+        )
+        self.assertIsNotNone(model.stop_head.weight.grad)
 
 
 class CombinedLossTests(unittest.TestCase):

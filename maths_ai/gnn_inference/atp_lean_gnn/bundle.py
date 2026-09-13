@@ -403,7 +403,7 @@ def _vocabularies_from_prepared_root(
 # corpus, so they are useless to a consumer, and shipping them publishes the
 # server's directory layout and username. They are replaced rather than dropped
 # because ``BaselineConfig.from_dict`` requires the key to be present.
-REDACTED_CONFIG_FIELDS = ("prepared_root", "run_root")
+REDACTED_CONFIG_FIELDS = ("prepared_root", "run_root", "initialization_checkpoint")
 REDACTED_CONFIG_VALUE = "."
 
 
@@ -708,8 +708,8 @@ def export_model_bundle(
         "source_checkpoint_sha256": file_sha256(checkpoint_path),
         "source_epoch": int(checkpoint.get("epoch", 0)),
         "source_run": source_run_dir.name,
-        "vocab_source": vocab_source,
-        "config_source": config_source,
+        "vocab_source": vocab_source if vocab_source == "checkpoint" else PurePosixPath(str(vocab_source)).name or REDACTED_CONFIG_VALUE,
+        "config_source": config_source if config_source == "checkpoint" else PurePosixPath(str(config_source)).name or REDACTED_CONFIG_VALUE,
         "copied_run_files": copied,
         "optimizer_state_included": False,
     }

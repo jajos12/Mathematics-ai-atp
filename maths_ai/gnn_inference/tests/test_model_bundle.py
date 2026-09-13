@@ -529,7 +529,17 @@ class ModelBundleTests(unittest.TestCase):
             output_dir=bundle_dir,
             prepared_root=self.prepared_root,
         )
-        self.assertEqual(manifest["vocab_source"], str(self.prepared_root))
+        # The recorded source is the basename, not the training host's path:
+        # the manifest is published and absolute paths leak the account and
+        # cluster layout.
+        self.assertEqual(manifest["vocab_source"], self.prepared_root.name)
+
+        # And the written manifest on disk contains no absolute paths at all.
+        written = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
+        serialized = json.dumps(written)
+        self.assertNotIn("/home/", serialized)
+        self.assertNotIn(str(self.prepared_root), serialized)
+        self.assertNotIn("initialization_checkpoint\": \"/", serialized.replace("\\\"", "\""))
 
     # ------------------------------------------------------------------
     # Pointer bundles, baseline wrapping, and the scorer companion

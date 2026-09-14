@@ -566,7 +566,34 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
         lemma_index = None
     else:
         console_print(f"  Lemma index: {lemma_index_file}")
-        lemma_index = LemmaIndex.load(lemma_index_file)
+        # The index must have been built by *this* pointer's backbone before
+        # retrieval trains against it. A mismatched index scores plausible
+        # nonsense (same dimensions, different vector space), which is worse
+        # than no index at all -- the old behavior loaded it unconditionally.
+        # The binding is over the encoder's weight tensors, so an index built
+        # from the baseline this pointer was initialized from is refused too
+        # once the backbone has trained; rebuild the index from the pointer
+        # checkpoint before the scorer stage.
+        from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import (
+            load_index_for_encoder,
+        )
+
+        index_probe = torch.load(pointer_checkpoint, map_location="cpu", weights_only=False)
+        index_probe_state = (
+            index_probe["model_state_dict"]
+            if "model_state_dict" in index_probe else index_probe
+        )
+        try:
+            lemma_index = load_index_for_encoder(
+                lemma_index_file,
+                encoder_state_dict=index_probe_state,
+                node_vocab=metadata.node_vocab,
+                tactic_vocab=metadata.tactic_vocab,
+            )
+        except ValueError as exc:
+            console_print(f"  ERROR: {exc}")
+            return {"error": "lemma index does not match its encoder"}
+        del index_probe, index_probe_state
 
     datasets, loaders = build_dataloaders(
         metadata, p_config, required_fields=REQUIRED_POINTER_DATA_FIELDS

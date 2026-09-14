@@ -180,7 +180,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.index_path:
         index_path = Path(args.index_path)
         if index_path.exists():
-            lemma_index = LemmaIndex.load(index_path)
+            from atp_lean_gnn.lemma_index import (
+                read_index_manifest,
+                load_index_for_encoder,
+            )
+
+            manifest = read_index_manifest(index_path)
+            if manifest.get("encoder_state_sha256"):
+                # Verify the index was built by this model's encoder before
+                # retrieval runs: same dimensions but a different vector
+                # space returns plausible wrong premises with no error.
+                try:
+                    lemma_index = load_index_for_encoder(
+                        index_path,
+                        encoder_state_dict=model.state_dict(),
+                        node_vocab=metadata.node_vocab,
+                        tactic_vocab=metadata.tactic_vocab,
+                    )
+                except ValueError as exc:
+                    print(f"ERROR: {exc}")
+                    return 1
+            else:
+                # Pre-binding index: load, but say it is unverified.
+                print(
+                    "WARNING: index predates encoder binding (no "
+                    "encoder_state_sha256 in its manifest); loading it "
+                    "unverified. Rebuild it with build_lemma_index.py."
+                )
+                lemma_index = LemmaIndex.load(index_path)
             print(f"Loaded index with {len(lemma_index.lemma_ids)} lemmas.")
         else:
             print(f"WARNING: index path {index_path} not found.")

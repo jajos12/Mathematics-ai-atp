@@ -201,14 +201,34 @@ def build_index(
                 handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True))
                 handle.write("\n")
 
+    # The index's correctness depends entirely on which encoder produced its
+    # vectors: retraining the same architecture leaves every vector in a
+    # different space, with no shape error to catch it, so retrieval returns
+    # confident nonsense.  The manifest therefore binds the index to its
+    # encoder by a hash over the encoder's weight tensors -- not over the
+    # checkpoint file, because the same encoder can sit in a bare baseline
+    # checkpoint or under ``backbone.`` in a pointer checkpoint, and an index
+    # built from either must remain verifiable against both.
+    from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import state_dict_sha256
+    from maths_ai.gnn_inference.atp_lean_gnn.training import (
+        _stable_vocab_sha256 as stable_vocab_sha256,
+    )
+
     manifest = {
-        "corpus_path": str(corpus_path),
-        "prepared_root": str(prepared_root),
-        "checkpoint_path": str(checkpoint_path),
+        # Basenames only: this manifest is published alongside the index, and
+        # the absolute paths would leak the training account and layout.
+        "corpus_path": corpus_path.name,
+        "corpus_sha256": file_sha256(corpus_path),
+        "checkpoint_path": checkpoint_path.name,
+        "encoder_state_sha256": state_dict_sha256(model.state_dict()),
+        "encoder_epoch": int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else None,
+        "node_vocab_sha256": stable_vocab_sha256(metadata.node_vocab),
+        "tactic_vocab_sha256": stable_vocab_sha256(metadata.tactic_vocab),
         "config_path": None if config_path is None else str(config_path),
         "edge_mode": edge_mode,
         "batch_size": batch_size,
         "normalize": normalize,
+        "hidden_dim": int(config.model.hidden_dim),
         "total_count": len(records),
         "success_count": len(lemma_ids),
         "failure_count": len(failures),

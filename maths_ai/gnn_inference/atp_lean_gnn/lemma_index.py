@@ -27,12 +27,17 @@ class LemmaIndex:
         *,
         lemma_names: list[str] | None = None,
         normalize_queries: bool = False,
+        manifest: dict[str, Any] | None = None,
     ) -> None:
         self.index = index
         self.lemma_ids = lemma_ids
         self.lemma_vectors = lemma_vectors
         self.normalize_queries = normalize_queries
+        self.manifest = dict(manifest or {})
         self.lemma_names = lemma_names or []
+        self.id_to_position = {
+            lemma_id: position for position, lemma_id in enumerate(self.lemma_ids)
+        }
         self.name_to_id = {
             name: lemma_id for name, lemma_id in zip(self.lemma_names, self.lemma_ids)
         }
@@ -113,6 +118,7 @@ class LemmaIndex:
             lemma_vectors,
             lemma_names=lemma_names,
             normalize_queries=normalize_queries,
+            manifest=manifest,
         )
 
     def search(
@@ -181,6 +187,14 @@ def read_index_manifest(index_dir: str | Path) -> dict[str, Any]:
     return manifest
 
 
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _tensor_bytes(tensor: Any) -> bytes:
     """Raw bytes of a tensor, whatever its dtype (bfloat16 has no numpy)."""
     import torch
@@ -246,6 +260,8 @@ def load_index_for_encoder(
     encoder_state_dict: Any,
     node_vocab: dict[str, int],
     tactic_vocab: dict[str, int],
+    corpus_path: str | Path | None = None,
+    expected_edge_mode: str | None = None,
 ) -> LemmaIndex:
     """Load an index only when it was built by exactly this encoder.
 
@@ -291,16 +307,40 @@ def load_index_for_encoder(
 
     expected_node = manifest.get("node_vocab_sha256")
     expected_tactic = manifest.get("tactic_vocab_sha256")
-    if expected_node and str(expected_node) != stable_vocab_sha256(node_vocab):
+    if not expected_node or not expected_tactic:
+        raise ValueError(
+            f"Lemma index '{index_dir}' does not record both vocabulary hashes; "
+            "rebuild it before use."
+        )
+    if str(expected_node) != stable_vocab_sha256(node_vocab):
         raise ValueError(
             f"Lemma index '{index_dir}' was built with a different node "
             "vocabulary. The lemma graphs were encoded against different "
             "labels than the running model uses."
         )
-    if expected_tactic and str(expected_tactic) != stable_vocab_sha256(tactic_vocab):
+    if str(expected_tactic) != stable_vocab_sha256(tactic_vocab):
         raise ValueError(
             f"Lemma index '{index_dir}' was built with a different tactic "
             "vocabulary."
         )
+
+    if corpus_path is not None:
+        expected_corpus = manifest.get("corpus_sha256")
+        if not expected_corpus:
+            raise ValueError(
+                f"Lemma index '{index_dir}' records no corpus_sha256; rebuild it."
+            )
+        actual_corpus = _file_sha256(corpus_path)
+        if str(expected_corpus) != actual_corpus:
+            raise ValueError(
+                f"Lemma index '{index_dir}' was built from a different lemma corpus."
+            )
+    if expected_edge_mode is not None:
+        index_edge_mode = manifest.get("edge_mode")
+        if index_edge_mode != expected_edge_mode:
+            raise ValueError(
+                f"Lemma index '{index_dir}' uses edge_mode={index_edge_mode!r}, "
+                f"but the model uses {expected_edge_mode!r}."
+            )
 
     return LemmaIndex.load(index_dir, manifest=manifest)

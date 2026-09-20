@@ -73,7 +73,36 @@ uv pip install -e .
 uv add -r requirements.txt
 ```
 
-3. Test a theorem:
+3. Download the trained GNN model from Hugging Face into the local repository.
+
+```bash
+uv pip install -U huggingface_hub
+
+hf download jajostrains/Mathlib-Sexpr-GNN \
+  --repo-type model \
+  --local-dir maths_ai/gnn_inference/artifacts/models/Mathlib-Sexpr-GNN
+```
+
+`--local-dir` materializes real files under the repository instead of relying on
+paths inside the Hugging Face cache. The destination is under `artifacts/`, which
+is ignored by Git. The model repository is public; if Hugging Face asks for
+authentication, run `hf auth login` first.
+
+Verify the pointer bundle and run a local inference smoke test:
+
+```bash
+test -f maths_ai/gnn_inference/artifacts/models/Mathlib-Sexpr-GNN/pointer-gat-gru/manifest.json
+
+python maths_ai/gnn_inference/scripts/run_inference.py \
+  --bundle maths_ai/gnn_inference/artifacts/models/Mathlib-Sexpr-GNN/pointer-gat-gru \
+  --state $'n : Nat\n⊢ n = n'
+```
+
+The bundle includes model configuration and vocabularies, so this inference
+path does not require the prepared training dataset. To update an existing local
+copy, rerun the same `hf download` command.
+
+4. Test a theorem:
 
 ```bash
 ./scripts/run_prover.sh --hypotheses "COMMA SEPARATED HYPOTHESESES" --goal_statement "GOAL EXPRESSION"

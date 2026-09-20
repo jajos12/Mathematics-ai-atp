@@ -68,6 +68,13 @@ def _extract_arg_targets(batch, max_args: int, device: torch.device) -> torch.Te
         if n > 0:
             shifted = sample_indices[:n].clone()
             valid = shifted >= 0
+            graph_size = int((ptr[i + 1] - ptr[i]).item())
+            if (shifted[valid] >= graph_size).any():
+                bad = int(shifted[valid][shifted[valid] >= graph_size][0].item())
+                raise ValueError(
+                    f"argument node index {bad} is outside graph {i} "
+                    f"({graph_size} nodes)"
+                )
             shifted[valid] = shifted[valid] + ptr[i]
             targets[i, :n] = shifted
 

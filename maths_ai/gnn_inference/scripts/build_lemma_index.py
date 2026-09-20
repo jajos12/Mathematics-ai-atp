@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
 
 
 from maths_ai.gnn_inference.atp_lean_gnn.graph import lemma_statement_to_dag
+from maths_ai.gnn_inference.atp_lean_gnn.bundle import file_sha256
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
@@ -220,11 +221,12 @@ def build_index(
         "corpus_path": corpus_path.name,
         "corpus_sha256": file_sha256(corpus_path),
         "checkpoint_path": checkpoint_path.name,
+        "checkpoint_sha256": file_sha256(checkpoint_path),
         "encoder_state_sha256": state_dict_sha256(model.state_dict()),
         "encoder_epoch": int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else None,
         "node_vocab_sha256": stable_vocab_sha256(metadata.node_vocab),
         "tactic_vocab_sha256": stable_vocab_sha256(metadata.tactic_vocab),
-        "config_path": None if config_path is None else str(config_path),
+        "config_path": None if config_path is None else config_path.name,
         "edge_mode": edge_mode,
         "batch_size": batch_size,
         "normalize": normalize,

@@ -195,7 +195,7 @@ def _find_target_index_in_pool(
         for pool_idx, (source, cid) in enumerate(
             zip(pool.candidate_sources, pool.candidate_ids)
         ):
-            if source == "lemma" and cid == lemma_id:
+            if source == "library" and cid == lemma_id:
                 return pool_idx
 
     return -1

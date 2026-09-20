@@ -43,11 +43,20 @@ class STV(BaseModel):
         return self.strength * self.confidence
 
 
+class StableArgumentRef(BaseModel):
+    """Source-qualified argument identity, stable across display renaming."""
+
+    source: str
+    candidate_id: int
+    graph_id: int | None = None
+
+
 class TacticCandidate(BaseModel):
-    """A single ranked tactic prediction from the GNN engine."""
+    """One ranked complete action from the GNN engine."""
 
     tactic_name: str
     arguments: List[str] = Field(default_factory=list)
+    argument_refs: List[StableArgumentRef] = Field(default_factory=list)
     probability: float
 
 

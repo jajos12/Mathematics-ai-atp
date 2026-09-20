@@ -17,8 +17,27 @@ from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import (
     ArgumentSelector,
     TacticWithArgsClassifier,
     compute_combined_loss,
+    resolve_arg_targets_to_padded,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
+
+
+class StrictArgumentIndexTests(unittest.TestCase):
+    def test_rejects_out_of_range_global_node(self) -> None:
+        batch_index = torch.tensor([0, 0, 1, 1])
+        targets = torch.tensor([[4], [-1]])
+        with self.assertRaisesRegex(ValueError, "outside the batched graph"):
+            resolve_arg_targets_to_padded(
+                targets, batch_index, 2, torch.device("cpu")
+            )
+
+    def test_rejects_cross_graph_global_node(self) -> None:
+        batch_index = torch.tensor([0, 0, 1, 1])
+        targets = torch.tensor([[2], [-1]])
+        with self.assertRaisesRegex(ValueError, "belongs to graph 1, expected graph 0"):
+            resolve_arg_targets_to_padded(
+                targets, batch_index, 2, torch.device("cpu")
+            )
 
 
 class TacticArityRegistryTests(unittest.TestCase):
@@ -315,7 +334,7 @@ class CombinedLossTests(unittest.TestCase):
             torch.randn(3, 6, requires_grad=True),
         ]
         stop_logits = [torch.randn(3, requires_grad=True) for _ in range(3)]
-        targets = torch.tensor([[0, -1, -1], [1, 2, -1], [3, 4, 5]])
+        targets = torch.tensor([[0, -1, -1], [3, 2, -1], [4, 5, 4]])
         batch_index = torch.cat([
             torch.zeros(2, dtype=torch.long),
             torch.ones(2, dtype=torch.long),
@@ -367,7 +386,7 @@ class CombinedLossTests(unittest.TestCase):
         arg_logits = [torch.randn(2, 6, requires_grad=True) for _ in range(2)]
         # Sample 0: two node targets then a lemma citation (-1).
         # Sample 1: one node target, one lemma citation, one truncated.
-        targets = torch.tensor([[0, 1, -1], [2, -1, 3]])
+        targets = torch.tensor([[0, 1, -1], [5, -1, 3]])
         _, metrics = compute_combined_loss(
             tactic_logits,
             arg_logits,
@@ -401,7 +420,7 @@ class CombinedLossTests(unittest.TestCase):
             tactic_logits,
             arg_logits,
             torch.tensor([1, 1]),
-            torch.tensor([[0, -1], [1, 2]]),
+            torch.tensor([[0, -1], [4, 5]]),
             torch.cat([torch.zeros(3, dtype=torch.long), torch.ones(3, dtype=torch.long)]),
             arg_count_per_sample=[2, 3],
             stop_logits_list=stop_logits,
@@ -421,7 +440,7 @@ class CombinedLossTests(unittest.TestCase):
             tactic_logits.detach(),
             [a.detach() for a in arg_logits],
             torch.tensor([1, 1]),
-            torch.tensor([[0, -1], [1, 2]]),
+            torch.tensor([[0, -1], [4, 5]]),
             torch.cat([torch.zeros(3, dtype=torch.long), torch.ones(3, dtype=torch.long)]),
             arg_count_per_sample=[2, 3],
             stop_logits_list=never_stop,

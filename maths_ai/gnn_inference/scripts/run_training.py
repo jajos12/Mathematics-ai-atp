@@ -132,6 +132,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "k": 200,
         "premise_loss_weight": 1.0,
         "scoring_mode": "dot",
+        "retriever_checkpoint": None,
+        "corpus_path": None,
     },
 
     "seed": 42,
@@ -562,8 +564,8 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
             lemma_index_file = lemma_index_dir
 
     if lemma_index_file is None:
-        console_print("  WARNING: No lemma index found. Scorer training will use local candidates only.")
-        lemma_index = None
+        console_print("  ERROR: No lemma index found. Unified reranker requires external candidates.")
+        return {"error": "lemma index not found"}
     else:
         console_print(f"  Lemma index: {lemma_index_file}")
         # The index must have been built by *this* pointer's backbone before
@@ -576,6 +578,7 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
         # checkpoint before the scorer stage.
         from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import (
             load_index_for_encoder,
+            state_dict_sha256,
         )
 
         index_probe = torch.load(pointer_checkpoint, map_location="cpu", weights_only=False)
@@ -583,12 +586,32 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
             index_probe["model_state_dict"]
             if "model_state_dict" in index_probe else index_probe
         )
+        corpus_path = scorer_cfg.get("corpus_path")
+        if corpus_path is None:
+            default_corpus = (
+                Path("maths_ai")
+                / "gnn_inference"
+                / "artifacts"
+                / "lemmas"
+                / "v1"
+                / "corpus"
+                / "lemmas.jsonl"
+            )
+            if default_corpus.exists():
+                corpus_path = str(default_corpus)
+        if corpus_path is None or not Path(corpus_path).exists():
+            console_print(
+                "  ERROR: scorer.corpus_path must name the corpus used to build the index."
+            )
+            return {"error": "lemma corpus not found"}
         try:
             lemma_index = load_index_for_encoder(
                 lemma_index_file,
                 encoder_state_dict=index_probe_state,
                 node_vocab=metadata.node_vocab,
                 tactic_vocab=metadata.tactic_vocab,
+                corpus_path=corpus_path,
+                expected_edge_mode=p_config.edge_mode,
             )
         except ValueError as exc:
             console_print(f"  ERROR: {exc}")
@@ -618,18 +641,43 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
     model = model.to(device)
 
     scorer = PremiseScorer(hidden_dim=p_config.model.hidden_dim, mode=p_config_obj.scoring_mode).to(device)
+    retriever = None
+    retriever_checkpoint = scorer_cfg.get("retriever_checkpoint")
+    if retriever_checkpoint is None:
+        automatic_retriever = (
+            Path(config["run_root"])
+            / "premise_retriever"
+            / "best_run"
+            / "best.pt"
+        )
+        if automatic_retriever.exists():
+            retriever_checkpoint = str(automatic_retriever)
+    if retriever_checkpoint:
+        from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import (
+            load_retriever_checkpoint,
+        )
+
+        retriever = load_retriever_checkpoint(
+            retriever_checkpoint,
+            pointer_backbone=model.backbone,
+            hidden_dim=p_config.model.hidden_dim,
+            node_vocab=metadata.node_vocab,
+            tactic_vocab=metadata.tactic_vocab,
+            device=device,
+        )
+        console_print(f"  Retriever   : {retriever_checkpoint}")
 
     trainable_params = (
         list(model.tactic_embedding.parameters())
         + list(model.argument_selector.parameters())
-        + list(scorer.parameters())
+        + list(model.stop_head.parameters())
     )
     optimizer = AdamW(trainable_params, lr=p_config.training.learning_rate, weight_decay=p_config.training.weight_decay)
     grad_scaler = torch.amp.GradScaler(
         device.type, enabled=(amp_dtype == torch.float16)
     )
 
-    best_val_mrr = -1.0
+    best_val_action_exact = -1.0
     best_epoch = 0
     epochs_without_improvement = 0
     last_checkpoint_path = run_dir / "last.pt"
@@ -641,6 +689,7 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
         train_metrics = train_one_epoch_with_premises(
             model=model, scorer=scorer, loader=loaders["train"],
             lemma_index=lemma_index, optimizer=optimizer, grad_scaler=grad_scaler,
+            retriever=retriever,
             device=device, grad_clip=p_config.training.grad_clip,
             unknown_tactic_id=metadata.unknown_tactic_id,
             arg_loss_weight=p_config.arg_loss_weight if hasattr(p_config, "arg_loss_weight") else 0.5,
@@ -654,9 +703,11 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
         val_metrics = evaluate_model_with_premises(
             model=model, scorer=scorer, loader=loaders["val"],
             lemma_index=lemma_index, device=device,
+            retriever=retriever,
             unknown_tactic_id=metadata.unknown_tactic_id,
             arg_loss_weight=p_config.arg_loss_weight if hasattr(p_config, "arg_loss_weight") else 0.5,
             premise_loss_weight=p_config_obj.premise_loss_weight,
+            tactic_vocab=metadata.tactic_vocab,
             k=p_config_obj.k, split_name="val",
             log_every_batches=p_config.training.log_every_batches,
             use_amp=use_amp, amp_dtype=amp_dtype,
@@ -665,33 +716,63 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
 
         console_print(
             f"  Epoch {epoch:02d}/{p_config.training.epochs:02d} | "
-            f"Val MRR: {val_metrics['premise_mrr']:.4f} | "
-            f"Hit@1: {val_metrics['premise_top1_accuracy']:.4f} | "
-            f"Hit@5: {val_metrics['premise_top5_accuracy']:.4f}"
+            "Action exact (pred/oracle): "
+            f"{val_metrics['complete_action_exact_match_predicted_tactic']:.4f}/"
+            f"{val_metrics['complete_action_exact_match_oracle_tactic']:.4f} | "
+            f"Action R@5: {val_metrics['action_recall_at_5_predicted_tactic']:.4f} | "
+            f"Source: {val_metrics['candidate_source_accuracy_predicted_tactic']:.4f}"
         )
 
         if (
-            val_metrics["premise_mrr"]
-            > best_val_mrr + p_config.training.early_stopping_min_delta
+            val_metrics["complete_action_exact_match_predicted_tactic"]
+            > best_val_action_exact + p_config.training.early_stopping_min_delta
         ):
-            best_val_mrr = val_metrics["premise_mrr"]
+            best_val_action_exact = val_metrics[
+                "complete_action_exact_match_predicted_tactic"
+            ]
             best_epoch = epoch
             epochs_without_improvement = 0
             torch.save({
                 "epoch": epoch,
+                "model_type": "unified_action_reranker",
+                "config": p_config.to_dict(),
                 "model_state_dict": model.state_dict(),
                 "scorer_state_dict": scorer.state_dict(),
                 "val_metrics": val_metrics,
+                "node_vocab": metadata.node_vocab,
+                "tactic_vocab": metadata.tactic_vocab,
+                "lemma_index_manifest": getattr(lemma_index, "manifest", None),
+                "retriever_checkpoint": (
+                    None
+                    if retriever_checkpoint is None
+                    else Path(retriever_checkpoint).name
+                ),
+                "retriever_state_sha256": (
+                    None if retriever is None else state_dict_sha256(retriever.state_dict())
+                ),
             }, best_checkpoint_path)
         else:
             epochs_without_improvement += 1
 
         torch.save({
             "epoch": epoch,
+            "model_type": "unified_action_reranker",
+            "config": p_config.to_dict(),
             "model_state_dict": model.state_dict(),
             "scorer_state_dict": scorer.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_metrics": val_metrics,
+            "node_vocab": metadata.node_vocab,
+            "tactic_vocab": metadata.tactic_vocab,
+            "lemma_index_manifest": getattr(lemma_index, "manifest", None),
+            "retriever_checkpoint": (
+                None
+                if retriever_checkpoint is None
+                else Path(retriever_checkpoint).name
+            ),
+            "retriever_state_sha256": (
+                None if retriever is None else state_dict_sha256(retriever.state_dict())
+            ),
         }, last_checkpoint_path)
 
         logger.log_epoch(epoch, {
@@ -702,6 +783,10 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
             "val_premise_mrr": float(val_metrics["premise_mrr"]),
             "val_premise_top1_accuracy": float(val_metrics["premise_top1_accuracy"]),
             "val_premise_top5_accuracy": float(val_metrics["premise_top5_accuracy"]),
+            "val_complete_action_exact_predicted": float(val_metrics["complete_action_exact_match_predicted_tactic"]),
+            "val_complete_action_exact_oracle": float(val_metrics["complete_action_exact_match_oracle_tactic"]),
+            "val_action_recall_at_5_predicted": float(val_metrics["action_recall_at_5_predicted_tactic"]),
+            "val_candidate_source_accuracy_predicted": float(val_metrics["candidate_source_accuracy_predicted_tactic"]),
         })
 
         if (
@@ -709,7 +794,7 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
             and epochs_without_improvement >= p_config.training.early_stopping_patience
         ):
             console_print(
-                "  Early stopping: validation MRR did not improve for "
+                "  Early stopping: validation complete-action exact match did not improve for "
                 f"{epochs_without_improvement} epochs (best epoch {best_epoch})."
             )
             break
@@ -722,9 +807,11 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
     test_metrics = evaluate_model_with_premises(
         model=model, scorer=scorer, loader=loaders["test"],
         lemma_index=lemma_index, device=device,
+        retriever=retriever,
         unknown_tactic_id=metadata.unknown_tactic_id,
         arg_loss_weight=p_config.arg_loss_weight,
         premise_loss_weight=p_config_obj.premise_loss_weight,
+        tactic_vocab=metadata.tactic_vocab,
         k=p_config_obj.k, split_name="test",
         log_every_batches=p_config.training.log_every_batches,
         use_amp=use_amp, amp_dtype=amp_dtype,
@@ -757,7 +844,7 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "run_dir": str(run_dir),
-        "best_val_mrr": best_val_mrr,
+        "best_val_action_exact": best_val_action_exact,
         "best_checkpoint": str(best_checkpoint_path),
         "summary": summary,
         "best_run_link": str(best_run_link),

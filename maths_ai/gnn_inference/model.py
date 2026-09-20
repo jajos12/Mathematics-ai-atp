@@ -5,6 +5,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
+from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import DualEncoderRetriever
 
 
 class GNNPredictor:
@@ -18,6 +19,8 @@ class GNNPredictor:
         device: torch.device,
         k: int = 500,
         lemma_corpus: dict[int, LemmaRecord] | None = None,
+        retriever: DualEncoderRetriever | None = None,
+        edge_mode: str = "bidirectional",
         *,
         pantograph_project_path: str = "maths_ai/lean_mathlib",
     ):
@@ -32,6 +35,8 @@ class GNNPredictor:
             device=device,
             k=k,
             lemma_corpus=lemma_corpus,
+            retriever=retriever,
+            edge_mode=edge_mode,
         )
         self.device = device
 

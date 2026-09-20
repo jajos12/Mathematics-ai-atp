@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import re
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
 from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
-from .premise_pool import build_unified_pools
+from .premise_pool import CandidateRef, CandidateSource, build_unified_pools
 from .premise_scoring import PremiseScorer
+from .premise_retrieval import DualEncoderRetriever
 from .pyg import build_premise_mask, dag_to_pyg
 from .state import ProofState, parse_state
 from .training import transform_edge_index
+from .unified_reranking import rank_complete_actions, rank_fresh_name_action
 
 # ── Tactic-aware argument filtering rules ──────────────────────────────────
 # Fresh name only: generate a new identifier, reject all candidates
@@ -184,20 +187,26 @@ class InferencePipeline:
         k: int = 500,
         lemma_corpus: dict[int, LemmaRecord] | None = None,
         scorer: PremiseScorer | None = None,
+        retriever: DualEncoderRetriever | None = None,
+        edge_mode: str = "bidirectional",
     ) -> None:
         self.model = model
         self.scorer = scorer
+        self.retriever = retriever
         self.lemma_index = lemma_index
         self.node_vocab = node_vocab
         self.tactic_vocab = tactic_vocab
         self.device = device
         self.k = k
         self.lemma_corpus = lemma_corpus
+        self.edge_mode = edge_mode
 
         # Invert tactic vocab for decoding
         self.id_to_tactic = {idx: name for name, idx in tactic_vocab.items()}
 
         self.model.eval()
+        if self.retriever is not None:
+            self.retriever.eval()
 
     @torch.no_grad()
     def predict_tactic(self, state_str: str) -> str:
@@ -247,12 +256,16 @@ class InferencePipeline:
         data = data.to(self.device)
         data.state_node_index = data.state_node_index.to(self.device)
         data.premise_mask = data.premise_mask.to(self.device)
-        # Apply bidirectional edges to match training edge_mode
-        data.edge_index = transform_edge_index(data.edge_index, edge_mode="bidirectional")
+        data.edge_index = transform_edge_index(data.edge_index, edge_mode=self.edge_mode)
         batch = Batch.from_data_list([data])
 
         node_embeddings = self.model.backbone.encode_nodes(batch)
         state_emb = self.model.backbone.readout(node_embeddings, batch)
+        retrieval_state_emb = (
+            state_emb
+            if self.retriever is None
+            else self.retriever.encode_states(batch)
+        )
         
         tactic_logits = self.model.backbone.classifier(state_emb)
         tactic_probs = torch.softmax(tactic_logits.squeeze(0), dim=-1)
@@ -263,164 +276,128 @@ class InferencePipeline:
             for item in top_candidates
         ]
 
+        pool_kwargs = {"lemma_index": self.lemma_index, "k": self.k}
+        if self.retriever is not None:
+            pool_kwargs["retrieval_state_vecs"] = retrieval_state_emb
         pools = build_unified_pools(
             state_emb,
             node_embeddings,
             batch.premise_mask,
             batch.batch,
-            lemma_index=self.lemma_index,
-            k=self.k,
+            **pool_kwargs,
         )
         pool = pools[0]
         # Built once: the pointer head may select the same `FV{i}` node for
         # several tactic candidates, and the walk is over every node in the DAG.
         local_names = _local_names_by_fv_label(dag)
 
+        def candidate_allowed(tactic_id: int, candidate) -> bool:
+            tactic_name = self.id_to_tactic.get(tactic_id, "<UNK>")
+            return not (
+                tactic_name in _LOCAL_ONLY_TACTICS
+                and candidate.source is not CandidateSource.LOCAL
+            )
+
+        ranked_actions = rank_complete_actions(
+            self.model,
+            state_emb,
+            tactic_logits.squeeze(0),
+            pool,
+            self.id_to_tactic,
+            top_k=top_k,
+            beam_size=max(top_k, 8),
+            candidate_filter=candidate_allowed,
+            tactic_filter=lambda tactic_id: self.id_to_tactic.get(tactic_id, "<UNK>")
+            not in _FRESH_NAME_TACTICS,
+        )
+        fresh_names = _extract_fresh_names_from_dag(dag)
+        tactic_log_probabilities = F.log_softmax(tactic_logits.squeeze(0), dim=0)
+        fresh_node_indices = [
+            next(
+                (index for index, node in enumerate(dag.nodes) if node.label == name),
+                0,
+            )
+            for name in fresh_names
+        ]
+        fresh_candidates = [
+            CandidateRef(
+                source=CandidateSource.LOCAL,
+                stable_id=node_index,
+                graph_id=0,
+                local_node_index=node_index,
+                expression=name,
+                metadata={"fresh_name": True},
+            )
+            for name, node_index in zip(fresh_names, fresh_node_indices)
+        ]
+        fresh_vectors = (
+            node_embeddings[fresh_node_indices]
+            if fresh_node_indices
+            else node_embeddings.new_empty((0, self.model.hidden_dim))
+        )
+        for tactic_id, tactic_name in self.id_to_tactic.items():
+            if tactic_name not in _FRESH_NAME_TACTICS:
+                continue
+            ranked_actions.append(
+                rank_fresh_name_action(
+                    self.model,
+                    state_emb,
+                    tactic_id=tactic_id,
+                    tactic_name=tactic_name,
+                    tactic_log_probability=float(
+                        tactic_log_probabilities[tactic_id].item()
+                    ),
+                    candidates=fresh_candidates,
+                    candidate_vectors=fresh_vectors,
+                )
+            )
+        ranked_actions.sort(key=lambda action: action.log_probability, reverse=True)
+        ranked_actions = ranked_actions[:top_k]
         top_tactic_predictions: list[dict[str, object]] = []
-        for candidate in top_candidates:
-            tactic_id = int(candidate["tactic_id"])
-            tactic_name = str(candidate["tactic_name"])
-            tactic_id_tensor = torch.tensor([tactic_id], dtype=torch.long, device=self.device)
-            tactic_emb = self.model.tactic_embedding(tactic_id_tensor)
-
-            if not pool.candidate_ids:
-                top_tactic_predictions.append(
-                    {
-                        "tactic_id": tactic_id,
-                        "tactic_name": tactic_name,
-                        "probability": float(candidate["probability"]),
-                        "selected_arguments": [],
-                        "selected_argument_details": [],
-                    }
-                )
-                continue
-
-            # ── Tactic-aware argument filtering ──────────────────────────
-            if tactic_name in _FRESH_NAME_TACTICS:
-                # The stop head governs how many names to generate, the same
-                # rule as every other tactic.  The candidates are the outermost
-                # forall binders of the goal, not DAG pointer targets, so the
-                # names themselves still come from the DAG walk.
-                fresh_names = _extract_fresh_names_from_dag(dag)
-                decoder_state = self.model.argument_selector.initial_state(
-                    state_emb, tactic_emb
-                )
-                fresh_count = 0
-                for step in range(self.model.max_args + 1):
-                    if float(self.model.stop_head(decoder_state).item()) >= 0:
-                        break
-                    if step == self.model.max_args:
-                        break
-                    if fresh_count >= len(fresh_names):
-                        break
-                    # The decoder still consumes a candidate embedding so the
-                    # recurrence advances; the binder's node embedding is not
-                    # in the pool, so the selected fresh name stands in for it.
-                    name = fresh_names[fresh_count]
-                    fresh_count += 1
-                    fresh_idx = next(
-                        (i for i, n in enumerate(dag.nodes) if n.label == name), 0
-                    )
-                    fresh_emb = node_embeddings[
-                        torch.tensor([fresh_idx], device=self.device)
-                    ]
-                    decoder_state = self.model.argument_selector.gru(
-                        fresh_emb, decoder_state
-                    )
-                top_tactic_predictions.append(
-                    {
-                        "tactic_id": tactic_id,
-                        "tactic_name": tactic_name,
-                        "probability": float(candidate["probability"]),
-                        "selected_arguments": fresh_names[:fresh_count],
-                        "selected_argument_details": [
-                            ArgumentPrediction(source="fresh", candidate_id=0, label=name, score=0.0)
-                            for name in fresh_names[:fresh_count]
-                        ],
-                    }
-                )
-                continue
-
-            candidate_mask = torch.tensor(
-                [src == "local" for src in pool.candidate_sources],
-                device=self.device,
-                dtype=torch.bool,
-            ) if tactic_name in _LOCAL_ONLY_TACTICS else torch.ones(
-                len(pool.candidate_ids), device=self.device, dtype=torch.bool
-            )
-            candidate_indices = torch.where(candidate_mask)[0]
-            if candidate_indices.numel() == 0:
-                top_tactic_predictions.append(
-                    {
-                        "tactic_id": tactic_id,
-                        "tactic_name": tactic_name,
-                        "probability": float(candidate["probability"]),
-                        "selected_arguments": [],
-                        "selected_argument_details": [],
-                    }
-                )
-                continue
-            candidate_vectors = pool.candidate_vectors[candidate_indices]
-            decoder_state = self.model.argument_selector.initial_state(state_emb, tactic_emb)
-            selected_positions = torch.zeros(
-                candidate_vectors.size(0), dtype=torch.bool, device=self.device
-            )
-            top_indices: list[int] = []
-            selected_scores: list[float] = []
-            for step in range(self.model.max_args + 1):
-                if float(self.model.stop_head(decoder_state).item()) >= 0:
-                    break
-                if step == self.model.max_args:
-                    break
-                # score_candidates keeps the decoder batch dimension, so a
-                # single-graph decode returns [1, P]; flatten it to [P] before
-                # indexing positions into it.
-                scores = self.model.argument_selector.score_candidates(
-                    decoder_state, candidate_vectors
-                ).squeeze(0)
-                scores = scores.masked_fill(selected_positions, float("-inf"))
-                selected_position = int(scores.argmax().item())
-                selected_score = float(scores[selected_position].item())
-                selected_positions[selected_position] = True
-                top_indices.append(int(candidate_indices[selected_position].item()))
-                selected_scores.append(selected_score)
-                selected_embedding = candidate_vectors[selected_position].unsqueeze(0)
-                decoder_state = self.model.argument_selector.gru(
-                    selected_embedding, decoder_state
-                )
-
-            arguments = []
-            selected_argument_details = []
-            for idx, score_value in zip(top_indices, selected_scores):
-                source = pool.candidate_sources[idx]
-                cid = pool.candidate_ids[idx]
-
-                if source == "local":
-                    node = dag.nodes[cid]
-                    arg_str = _resolve_local_node_name(node, dag, local_names)
-                else:
-                    if self.lemma_corpus and cid in self.lemma_corpus:
-                        arg_str = self.lemma_corpus[cid].name
-                    else:
-                        arg_str = f"<lemma_{cid}>"
-
-                arguments.append(arg_str)
-                selected_argument_details.append(
+        for action in ranked_actions:
+            arguments: list[str] = []
+            details: list[ArgumentPrediction] = []
+            if action.tactic_name in _FRESH_NAME_TACTICS:
+                arguments = [
+                    candidate.expression or f"fresh_{position}"
+                    for position, candidate in enumerate(action.arguments)
+                ]
+                details = [
                     ArgumentPrediction(
-                        source=source,
-                        candidate_id=cid,
-                        label=arg_str,
-                        score=score_value,
+                        source="fresh",
+                        candidate_id=candidate.stable_id,
+                        label=name,
+                        score=action.log_probability,
                     )
-                )
-
+                    for candidate, name in zip(action.arguments, arguments)
+                ]
+            else:
+                for candidate in action.arguments:
+                    if candidate.source is CandidateSource.LOCAL:
+                        node = dag.nodes[candidate.stable_id]
+                        label = _resolve_local_node_name(node, dag, local_names)
+                    elif self.lemma_corpus and candidate.stable_id in self.lemma_corpus:
+                        label = self.lemma_corpus[candidate.stable_id].name
+                    else:
+                        label = f"<lemma_{candidate.stable_id}>"
+                    arguments.append(label)
+                    details.append(
+                        ArgumentPrediction(
+                            source=candidate.source.value,
+                            candidate_id=candidate.stable_id,
+                            label=label,
+                            score=action.log_probability,
+                        )
+                    )
             top_tactic_predictions.append(
                 {
-                    "tactic_id": tactic_id,
-                    "tactic_name": tactic_name,
-                    "probability": float(candidate["probability"]),
+                    "tactic_id": action.tactic_id,
+                    "tactic_name": action.tactic_name,
+                    "probability": action.probability,
+                    "log_probability": action.log_probability,
+                    "stable_argument_ids": [candidate.key for candidate in action.arguments],
                     "selected_arguments": arguments,
-                    "selected_argument_details": selected_argument_details,
+                    "selected_argument_details": details,
                 }
             )
 

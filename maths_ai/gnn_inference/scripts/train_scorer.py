@@ -30,7 +30,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.bundle import (
     load_baseline_weights_into_pointer,
     load_state_dict_checked,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
+from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import load_index_for_encoder, state_dict_sha256
 from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer, PremiseScorerConfig
 from maths_ai.gnn_inference.atp_lean_gnn.premise_training import evaluate_model_with_premises, train_one_epoch_with_premises
@@ -61,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--premise-config", type=str, default="configs/premise_scoring.json", help="Path to premise scoring config")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to baseline checkpoint (best.pt)")
     parser.add_argument("--index-path", type=str, required=True, help="Path to FAISS index built from the baseline")
+    parser.add_argument("--corpus-path", type=str, required=True, help="Lemma corpus used to build --index-path")
+    parser.add_argument("--retriever-checkpoint", type=str, default=None, help="Optional best.pt from train_retriever; uses its trained query tower for candidate retrieval")
     parser.add_argument("--run-root", type=str, default="runs/premise_gnn", help="Directory to save run logs and checkpoints")
     args = parser.parse_args(argv)
 
@@ -78,10 +80,6 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = _create_run_dir(Path(args.run_root))
     console_print(f"Saving run to {run_dir}")
     logger = TrainingLogger(run_dir)
-
-    # Load Lemma Index
-    console_print(f"Loading lemma index from {args.index_path}...")
-    lemma_index = LemmaIndex.load(Path(args.index_path))
 
     # Build Dataloaders
     datasets, loaders = build_dataloaders(metadata, config)
@@ -135,21 +133,48 @@ def main(argv: list[str] | None = None) -> int:
 
     model = model.to(device)
 
+    # Refuse a stale index before retrieval enters training. Matching vector
+    # dimensions do not imply matching encoder spaces.
+    console_print(f"Loading verified lemma index from {args.index_path}...")
+    lemma_index = load_index_for_encoder(
+        Path(args.index_path),
+        encoder_state_dict=model.state_dict(),
+        node_vocab=metadata.node_vocab,
+        tactic_vocab=metadata.tactic_vocab,
+        corpus_path=args.corpus_path,
+        expected_edge_mode=config.edge_mode,
+    )
+    retriever = None
+    if args.retriever_checkpoint:
+        from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import (
+            load_retriever_checkpoint,
+        )
+
+        retriever = load_retriever_checkpoint(
+            args.retriever_checkpoint,
+            pointer_backbone=model.backbone,
+            hidden_dim=config.model.hidden_dim,
+            node_vocab=metadata.node_vocab,
+            tactic_vocab=metadata.tactic_vocab,
+            device=device,
+        )
+
     # Build Premise Scorer
     scorer = PremiseScorer(hidden_dim=config.model.hidden_dim, mode=p_config.scoring_mode)
     scorer = scorer.to(device)
 
-    # Only train: tactic_embedding, argument_selector, and scorer
+    # One recurrent pointer reranks the mixed pool; the legacy scorer remains
+    # loadable but is no longer an independent action path.
     trainable_params = (
         list(model.tactic_embedding.parameters())
         + list(model.argument_selector.parameters())
-        + list(scorer.parameters())
+        + list(model.stop_head.parameters())
     )
     frozen_count = sum(p.numel() for p in model.backbone.parameters())
     trainable_count = sum(p.numel() for p in trainable_params)
     console_print(
         f"Parameters — frozen backbone: {frozen_count:,}, "
-        f"trainable (pointer + scorer + tactic_emb): {trainable_count:,}"
+        f"trainable (pointer + stop + tactic_emb): {trainable_count:,}"
     )
 
     optimizer = AdamW(
@@ -159,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     grad_scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
-    best_val_mrr = -1.0
+    best_val_action_exact = -1.0
 
     for epoch in range(1, config.training.epochs + 1):
         train_metrics = train_one_epoch_with_premises(
@@ -167,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             scorer=scorer,
             loader=loaders["train"],
             lemma_index=lemma_index,
+            retriever=retriever,
             optimizer=optimizer,
             grad_scaler=grad_scaler,
             device=device,
@@ -187,10 +213,12 @@ def main(argv: list[str] | None = None) -> int:
             scorer=scorer,
             loader=loaders["val"],
             lemma_index=lemma_index,
+            retriever=retriever,
             device=device,
             unknown_tactic_id=metadata.unknown_tactic_id,
             arg_loss_weight=config.arg_loss_weight if hasattr(config, "arg_loss_weight") else 0.5,
             premise_loss_weight=p_config.premise_loss_weight,
+            tactic_vocab=metadata.tactic_vocab,
             k=p_config.k,
             split_name="val",
             log_every_batches=config.training.log_every_batches,
@@ -199,14 +227,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         console_print(
-            f"Epoch {epoch} | Val MRR: {val_metrics['premise_mrr']:.4f} | "
-            f"Hit@1: {val_metrics['premise_top1_accuracy']:.4f} | "
-            f"Hit@5: {val_metrics['premise_top5_accuracy']:.4f} | "
-            f"Recall: {val_metrics['premise_recall']:.4f}"
+            f"Epoch {epoch} | Action exact (pred/oracle): "
+            f"{val_metrics['complete_action_exact_match_predicted_tactic']:.4f}/"
+            f"{val_metrics['complete_action_exact_match_oracle_tactic']:.4f} | "
+            f"Action R@5: {val_metrics['action_recall_at_5_predicted_tactic']:.4f} | "
+            f"Source: {val_metrics['candidate_source_accuracy_predicted_tactic']:.4f}"
         )
 
-        if val_metrics["premise_mrr"] > best_val_mrr:
-            best_val_mrr = val_metrics["premise_mrr"]
+        if val_metrics["complete_action_exact_match_predicted_tactic"] > best_val_action_exact:
+            best_val_action_exact = val_metrics["complete_action_exact_match_predicted_tactic"]
             # The config and both vocabularies ride along for the same reason
             # _save_checkpoint carries them: this checkpoint holds a fine-tuned
             # pointer whose tactic IDs and node IDs are only meaningful against
@@ -214,12 +243,22 @@ def main(argv: list[str] | None = None) -> int:
             # root is not a substitute for the mapping itself.
             torch.save({
                 "epoch": epoch,
+                "model_type": "unified_action_reranker",
                 "config": config.to_dict(),
                 "model_state_dict": model.state_dict(),
                 "scorer_state_dict": scorer.state_dict(),
                 "val_metrics": val_metrics,
                 "node_vocab": metadata.node_vocab,
                 "tactic_vocab": metadata.tactic_vocab,
+                "lemma_index_manifest": lemma_index.manifest,
+                "retriever_checkpoint": (
+                    None
+                    if args.retriever_checkpoint is None
+                    else Path(args.retriever_checkpoint).name
+                ),
+                "retriever_state_sha256": (
+                    None if retriever is None else state_dict_sha256(retriever.state_dict())
+                ),
             }, run_dir / "best.pt")
 
         logger.log_epoch(
@@ -238,11 +277,15 @@ def main(argv: list[str] | None = None) -> int:
                 "val_premise_top1_accuracy": float(val_metrics["premise_top1_accuracy"]),
                 "val_premise_top5_accuracy": float(val_metrics["premise_top5_accuracy"]),
                 "val_premise_recall": float(val_metrics["premise_recall"]),
+                "val_complete_action_exact_predicted": float(val_metrics["complete_action_exact_match_predicted_tactic"]),
+                "val_complete_action_exact_oracle": float(val_metrics["complete_action_exact_match_oracle_tactic"]),
+                "val_action_recall_at_5_predicted": float(val_metrics["action_recall_at_5_predicted_tactic"]),
+                "val_candidate_source_accuracy_predicted": float(val_metrics["candidate_source_accuracy_predicted_tactic"]),
                 "val_known_label_count": int(val_metrics["known_label_count"]),
                 "val_premise_target_present_count": int(val_metrics["premise_target_present_count"]),
                 "val_premise_valid_count": int(val_metrics["premise_valid_count"]),
                 "val_evaluated_count": int(val_metrics["evaluated_count"]),
-                "best_val_mrr": float(best_val_mrr),
+                "best_val_action_exact": float(best_val_action_exact),
             },
         )
 

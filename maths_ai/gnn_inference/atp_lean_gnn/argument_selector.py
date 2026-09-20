@@ -338,7 +338,8 @@ def resolve_arg_targets_to_padded(
     """Remap global node indices to padded per-graph positions.
 
     Returns [B, max_gt_args] of positions into the padded [B, N_max] logit
-    matrix, with -1 for invalid arguments.
+    matrix, with -1 for absent arguments. Invalid or cross-graph indices raise:
+    silently clamping them can train one proof state against another's node.
     """
     offsets = torch.zeros_like(batch_index)
     for b in range(batch_size):
@@ -353,11 +354,26 @@ def resolve_arg_targets_to_padded(
 
     flat_valid_indices = result[valid]
     total_nodes = batch_index.size(0)
-    oob = (flat_valid_indices >= total_nodes)
-    if oob.any():
-        temp = result.clone()
-        temp[valid] = torch.where(oob, torch.tensor(-1, device=device), offsets[flat_valid_indices.clamp(max=total_nodes - 1)])
-        return temp
+    if (flat_valid_indices >= total_nodes).any():
+        bad = int(flat_valid_indices[flat_valid_indices >= total_nodes][0].item())
+        raise ValueError(
+            f"argument node index {bad} is outside the batched graph ({total_nodes} nodes)"
+        )
+
+    expected_graphs = (
+        torch.arange(batch_size, device=device)
+        .unsqueeze(1)
+        .expand_as(result)[valid]
+    )
+    actual_graphs = batch_index[flat_valid_indices]
+    if (actual_graphs != expected_graphs).any():
+        mismatch = (actual_graphs != expected_graphs).nonzero(as_tuple=False)[0]
+        position = int(mismatch.item())
+        raise ValueError(
+            "argument node index belongs to graph "
+            f"{int(actual_graphs[position].item())}, expected graph "
+            f"{int(expected_graphs[position].item())}"
+        )
 
     result[valid] = offsets[flat_valid_indices]
     return result

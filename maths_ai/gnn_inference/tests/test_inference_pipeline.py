@@ -24,6 +24,10 @@ from maths_ai.gnn_inference.atp_lean_gnn.inference import (
     InferencePipeline,
     _extract_fresh_names_from_dag,
 )
+from maths_ai.gnn_inference.atp_lean_gnn.premise_pool import (
+    CandidateRef,
+    CandidateSource,
+)
 
 
 STATE = "h1 : P\nh2 : Q\n⊢ P ∧ Q"
@@ -39,6 +43,22 @@ class _FakePool:
         n_nodes = len(dag.nodes)
         self.candidate_ids = [min(1, n_nodes - 1), min(2, n_nodes - 1), 101, 102]
         self.candidate_sources = ["local", "local", "library", "library"]
+        self.candidates = [
+            CandidateRef(
+                source=CandidateSource.LOCAL,
+                stable_id=self.candidate_ids[0],
+                graph_id=0,
+                local_node_index=self.candidate_ids[0],
+            ),
+            CandidateRef(
+                source=CandidateSource.LOCAL,
+                stable_id=self.candidate_ids[1],
+                graph_id=0,
+                local_node_index=self.candidate_ids[1],
+            ),
+            CandidateRef(source=CandidateSource.LIBRARY, stable_id=101),
+            CandidateRef(source=CandidateSource.LIBRARY, stable_id=102),
+        ]
         self.candidate_vectors = torch.randn(4, HIDDEN_DIM)
 
 
@@ -47,8 +67,18 @@ class _LemmaRecord:
         self.name = name
 
 
+class _FakeRetriever:
+    def eval(self):
+        return self
+
+    def encode_states(self, batch):
+        return torch.full((1, HIDDEN_DIM), 42.0)
+
+
 class InferenceDecodeTests(unittest.TestCase):
-    def _build_pipeline(self, *, stop_bias: float) -> tuple[InferencePipeline, _FakePool]:
+    def _build_pipeline(
+        self, *, stop_bias: float, retriever=None, edge_mode: str = "bidirectional"
+    ) -> tuple[InferencePipeline, _FakePool]:
         torch.manual_seed(0)
         dag = proof_state_to_dag(STATE)
         node_vocab = build_vocab([dag])
@@ -74,7 +104,19 @@ class InferenceDecodeTests(unittest.TestCase):
             102: _LemmaRecord("Nat.mul_comm"),
         }
 
-        def fake_build_unified_pools(state_emb, node_embeddings, premise_mask, batch, *, lemma_index, k):
+        self.retrieval_state_vecs = None
+
+        def fake_build_unified_pools(
+            state_emb,
+            node_embeddings,
+            premise_mask,
+            batch,
+            *,
+            lemma_index,
+            k,
+            retrieval_state_vecs=None,
+        ):
+            self.retrieval_state_vecs = retrieval_state_vecs
             return [pool]
 
         patcher = mock.patch.object(
@@ -90,23 +132,20 @@ class InferenceDecodeTests(unittest.TestCase):
                 device=torch.device("cpu"),
                 k=500,
                 lemma_corpus=lemma_corpus,
+                retriever=retriever,
+                edge_mode=edge_mode,
             )
         return pipeline, pool
 
     def test_decode_selects_distinct_candidates_across_steps(self) -> None:
-        """A never-firing stop head decodes max_args distinct pool positions.
-
-        The second selection cannot repeat the first, so at least one selected
-        position is >= 1: exactly the indexing that crashed when the loop read
-        ``score_candidates``' [1, P] result as flat [P].
-        """
+        """Every complete-action beam uses each stable candidate at most once."""
         pipeline, pool = self._build_pipeline(stop_bias=-10.0)
         result = pipeline.predict_tactic_result(STATE, top_k=3)
         self.assertEqual(len(result.top_tactic_predictions), 3)
 
         for candidate in result.top_tactic_predictions:
             details = candidate["selected_argument_details"]
-            self.assertEqual(len(details), pipeline.model.max_args)
+            self.assertLessEqual(len(details), pipeline.model.max_args)
             positions = [d.candidate_id for d in details]
             # The same pool candidate must never be selected twice in one action.
             self.assertEqual(len(positions), len(set(positions)))
@@ -140,6 +179,30 @@ class InferenceDecodeTests(unittest.TestCase):
         # A full prediction still works without one.
         result = pipeline.predict_tactic_result(STATE, top_k=1)
         self.assertEqual(len(result.top_tactic_predictions), 1)
+        self.assertLess(result.top_tactic_predictions[0]["probability"], 1.0)
+
+    def test_pipeline_applies_configured_edge_mode(self) -> None:
+        pipeline, _ = self._build_pipeline(stop_bias=10.0, edge_mode="forward")
+        with mock.patch.object(
+            inference_module,
+            "transform_edge_index",
+            wraps=inference_module.transform_edge_index,
+        ) as transform:
+            pipeline.predict_tactic_result(STATE)
+        self.assertEqual(transform.call_args.kwargs["edge_mode"], "forward")
+
+    def test_trained_retriever_supplies_library_search_query(self) -> None:
+        pipeline, _ = self._build_pipeline(
+            stop_bias=10.0, retriever=_FakeRetriever()
+        )
+        pipeline.predict_tactic_result(STATE, top_k=1)
+        self.assertIsNotNone(self.retrieval_state_vecs)
+        self.assertTrue(
+            torch.equal(
+                self.retrieval_state_vecs,
+                torch.full((1, HIDDEN_DIM), 42.0),
+            )
+        )
 
     def test_fresh_name_tactics_take_their_count_from_the_stop_head(self) -> None:
         """``intro`` emits only as many fresh names as the stop head allows.

@@ -190,6 +190,39 @@ class LoadIndexForEncoderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "predates index-to-encoder binding"):
             self._load()
 
+    def test_manifest_without_vocab_hashes_is_refused(self) -> None:
+        manifest_path = self.index_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("node_vocab_sha256")
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "both vocabulary hashes"):
+            self._load()
+
+    def test_different_lemma_corpus_is_refused(self) -> None:
+        import hashlib
+
+        from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import (
+            load_index_for_encoder,
+        )
+
+        original = self.root / "original.jsonl"
+        original.write_text('{"lemma_id": 1, "name": "A", "statement": "A"}\n')
+        supplied = self.root / "supplied.jsonl"
+        supplied.write_text('{"lemma_id": 2, "name": "B", "statement": "B"}\n')
+        manifest_path = self.index_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["corpus_sha256"] = hashlib.sha256(original.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, "different lemma corpus"):
+            load_index_for_encoder(
+                self.index_dir,
+                encoder_state_dict=self.encoder,
+                node_vocab=self.NODE_VOCAB,
+                tactic_vocab=self.TACTIC_VOCAB,
+                corpus_path=supplied,
+            )
+
 
 class NormalizeRoundTripTests(unittest.TestCase):
     def test_build_time_normalize_reaches_query_time(self) -> None:

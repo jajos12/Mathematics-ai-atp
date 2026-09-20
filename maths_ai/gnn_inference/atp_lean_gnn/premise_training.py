@@ -16,10 +16,24 @@ from torch_geometric.loader import DataLoader
 
 from .argument_selector import TacticWithArgsClassifier, compute_combined_loss
 from .labels import parse_tactic_arguments
+from .graph import BINDER_KIND_FORALL
 from .lemma_index import LemmaIndex
-from .premise_pool import build_unified_pools
-from .premise_scoring import PremiseScorer, compute_premise_ranking_loss
+from .premise_pool import (
+    CandidateRef,
+    CandidateSource,
+    build_unified_pools,
+    ensure_library_targets,
+)
+from .premise_scoring import PremiseScorer
 from .reporting import console_print
+from .unified_reranking import (
+    ActionTarget,
+    complete_action_metrics,
+    compute_unified_reranking_loss,
+    rank_complete_actions,
+    rank_fresh_name_action,
+    resolve_ordered_pool_targets,
+)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -76,6 +90,16 @@ def _local_to_global_arg_targets(
     """Convert per-graph node ids to indices in the concatenated PyG batch."""
     global_targets = local_targets.clone()
     valid = global_targets >= 0
+    graph_sizes = (batch.ptr[1:] - batch.ptr[:-1]).to(
+        device=device, dtype=torch.long
+    ).unsqueeze(1)
+    invalid = valid & (global_targets >= graph_sizes)
+    if invalid.any():
+        row, column = invalid.nonzero(as_tuple=False)[0].tolist()
+        raise ValueError(
+            f"argument node index {int(global_targets[row, column].item())} "
+            f"is outside graph {row} ({int(graph_sizes[row, 0].item())} nodes)"
+        )
     offsets = batch.ptr[:-1].to(device=device, dtype=torch.long).unsqueeze(1)
     global_targets[valid] += offsets.expand_as(global_targets)[valid]
     return global_targets
@@ -127,6 +151,7 @@ def train_one_epoch_with_premises(
     loader: DataLoader,
     lemma_index: LemmaIndex,
     *,
+    retriever=None,
     optimizer: AdamW,
     grad_scaler,
     device: torch.device,
@@ -146,12 +171,18 @@ def train_one_epoch_with_premises(
     model.train()
     model.backbone.eval()  # frozen backbone stays in eval mode
     scorer.train()
+    if retriever is not None:
+        retriever.eval()
 
     total_tactic_loss = 0.0
     total_arg_loss = 0.0
     total_premise_loss = 0.0
     total_combined_loss = 0.0
     total_examples = 0
+    total_reranking_targets = 0
+    total_reranking_scored = 0
+    total_unresolved_targets = 0
+    total_source_correct_weighted = 0.0
     total_batches = len(loader)
     start_time = time.perf_counter()
 
@@ -203,11 +234,13 @@ def train_one_epoch_with_premises(
             with torch.no_grad():
                 node_embeddings = model.backbone.encode_nodes(batch)
                 state_emb = model.backbone.readout(node_embeddings, batch)
+                retrieval_state_emb = (
+                    state_emb
+                    if retriever is None
+                    else retriever.encode_states(batch)
+                )
             node_embeddings = node_embeddings.detach()
             state_emb = state_emb.detach()
-
-            # Get tactic embeddings
-            tactic_emb = model.tactic_embedding(targets)
 
             # Build premise mask
             premise_mask = batch.premise_mask.to(
@@ -222,17 +255,27 @@ def train_one_epoch_with_premises(
                 batch.batch,
                 lemma_index=lemma_index,
                 k=k,
+                retrieval_state_vecs=retrieval_state_emb,
             )
+            pools = ensure_library_targets(pools, lemma_index, arg_lemma_targets)
 
-            # Score candidates
-            score_list = scorer(state_emb, tactic_emb, pools)
-
-            # Premise ranking loss
-            p_loss, p_metrics = compute_premise_ranking_loss(
-                score_list,
+            target_positions, target_metrics = resolve_ordered_pool_targets(
                 pools,
                 arg_targets,
                 arg_lemma_targets,
+                arg_counts,
+                max_args=model.max_args,
+            )
+            # One recurrent pointer now scores both local and library
+            # candidates in argument order. The standalone scorer parameter is
+            # retained in this function's signature only for old callers and
+            # checkpoints; it no longer defines the action path.
+            p_loss, p_metrics = compute_unified_reranking_loss(
+                model,
+                state_emb,
+                targets,
+                pools,
+                target_positions,
             )
 
             # Total loss
@@ -254,9 +297,16 @@ def train_one_epoch_with_premises(
         batch_size = int(targets.numel())
         total_tactic_loss += ta_metrics["tactic_loss"] * batch_size
         total_arg_loss += ta_metrics["arg_loss"] * batch_size
-        total_premise_loss += p_metrics["premise_loss"] * batch_size
+        total_premise_loss += p_metrics["reranking_loss"] * batch_size
         total_combined_loss += float(total_loss.item()) * batch_size
         total_examples += batch_size
+        total_reranking_targets += int(p_metrics["target_count"])
+        total_reranking_scored += int(p_metrics["scored_target_count"])
+        total_unresolved_targets += int(target_metrics["unresolved_target_count"])
+        total_source_correct_weighted += (
+            float(p_metrics["candidate_source_accuracy"])
+            * int(p_metrics["scored_target_count"])
+        )
 
         if _should_log_batch(
             batch_index, total_batches, log_every_batches=log_every_batches
@@ -279,6 +329,13 @@ def train_one_epoch_with_premises(
         "premise_loss": total_premise_loss / n,
         "combined_loss": total_combined_loss / n,
         "example_count": total_examples,
+        "reranking_target_count": total_reranking_targets,
+        "reranking_scored_target_count": total_reranking_scored,
+        "reranking_target_coverage": total_reranking_scored
+        / max(total_reranking_targets, 1),
+        "reranking_unresolved_target_count": total_unresolved_targets,
+        "candidate_source_accuracy": total_source_correct_weighted
+        / max(total_reranking_scored, 1),
     }
 
 
@@ -289,10 +346,12 @@ def evaluate_model_with_premises(
     loader: DataLoader,
     lemma_index: LemmaIndex,
     *,
+    retriever=None,
     device: torch.device,
     unknown_tactic_id: int,
     arg_loss_weight: float,
     premise_loss_weight: float,
+    tactic_vocab: dict[str, int] | None = None,
     k: int = 500,
     split_name: str | None = None,
     log_every_batches: int | None = None,
@@ -303,6 +362,8 @@ def evaluate_model_with_premises(
     """Evaluate model with combined tactic + argument + premise metrics."""
     model.eval()
     scorer.eval()
+    if retriever is not None:
+        retriever.eval()
 
     total_tactic_loss = 0.0
     total_arg_loss = 0.0
@@ -311,11 +372,13 @@ def evaluate_model_with_premises(
     top1_correct = 0
     known_count = 0
 
-    premise_valid = 0
-    premise_target_present = 0
-    premise_top1_correct = 0
-    premise_top5_correct = 0
-    premise_mrr_sum = 0.0
+    reranking_target_count = 0
+    reranking_scored_count = 0
+    reranking_unresolved_count = 0
+    reranking_top1_weighted = 0.0
+    predicted_ranked_actions = []
+    oracle_ranked_actions = []
+    action_targets: list[ActionTarget] = []
 
     total_count = 0
     total_batches = len(loader)
@@ -360,8 +423,11 @@ def evaluate_model_with_premises(
             with torch.no_grad():
                 node_embeddings = model.backbone.encode_nodes(batch)
                 state_emb = model.backbone.readout(node_embeddings, batch)
-            tactic_ids = tactic_logits.argmax(dim=1)
-            tactic_emb = model.tactic_embedding(tactic_ids)
+                retrieval_state_emb = (
+                    state_emb
+                    if retriever is None
+                    else retriever.encode_states(batch)
+                )
             premise_mask = batch.premise_mask.to(
                 dtype=torch.bool, device=device
             )
@@ -373,25 +439,137 @@ def evaluate_model_with_premises(
                 batch.batch,
                 lemma_index=lemma_index,
                 k=k,
+                retrieval_state_vecs=retrieval_state_emb,
             )
-            score_list = scorer(state_emb, tactic_emb, pools)
-            p_loss, p_metrics = compute_premise_ranking_loss(
-                score_list, pools, arg_targets, arg_lemma_targets
+            target_positions, target_metrics = resolve_ordered_pool_targets(
+                pools,
+                arg_targets,
+                arg_lemma_targets,
+                arg_counts,
+                max_args=model.max_args,
             )
+            p_loss, p_metrics = compute_unified_reranking_loss(
+                model,
+                state_emb,
+                targets,
+                pools,
+                target_positions,
+            )
+
+        id_to_tactic = (
+            {tactic_id: name for name, tactic_id in tactic_vocab.items()}
+            if tactic_vocab is not None
+            else {
+                tactic_id: str(tactic_id)
+                for tactic_id in range(tactic_logits.size(1))
+            }
+        )
+        fresh_tactic_ids = {
+            tactic_id
+            for tactic_id, name in id_to_tactic.items()
+            if name in {"intro", "rintro", "introV2"}
+        }
+        for row, (pool, positions) in enumerate(zip(pools, target_positions)):
+            expected_count = min(arg_counts[row], model.max_args)
+            resolved = not (
+                arg_counts[row] > model.max_args
+                or len(positions) != expected_count
+                or any(position < 0 for position in positions)
+            )
+            expected_arguments = (
+                tuple(pool.candidates[position] for position in positions)
+                if resolved
+                else ()
+            )
+            action_targets.append(
+                ActionTarget(
+                    tactic_id=int(targets[row].item()),
+                    arguments=expected_arguments,
+                    resolved=resolved,
+                    argument_count=arg_counts[row],
+                )
+            )
+            graph_nodes = (batch.batch == row).nonzero(as_tuple=False).view(-1)
+            graph_offset = int(graph_nodes[0].item()) if graph_nodes.numel() else 0
+            source_nodes = set(int(value) for value in batch.edge_index[0].tolist())
+            fresh_global_ids = [
+                int(node_id)
+                for node_id in graph_nodes.tolist()
+                if int(batch.is_bound[node_id].item()) == 1
+                and int(batch.binder_kind[node_id].item()) == BINDER_KIND_FORALL
+                and int(batch.binder_depth[node_id].item()) == 1
+                and int(node_id) not in source_nodes
+            ] if all(
+                hasattr(batch, field)
+                for field in ("is_bound", "binder_kind", "binder_depth")
+            ) else []
+            fresh_candidates = [
+                CandidateRef(
+                    source=CandidateSource.LOCAL,
+                    stable_id=node_id - graph_offset,
+                    graph_id=row,
+                    local_node_index=node_id - graph_offset,
+                    metadata={"fresh_name": True},
+                )
+                for node_id in fresh_global_ids
+            ]
+            fresh_vectors = (
+                node_embeddings[fresh_global_ids]
+                if fresh_global_ids
+                else node_embeddings.new_empty((0, model.hidden_dim))
+            )
+
+            def ranked_for_logits(row_logits: Tensor, *, tactic_k: int | None = None):
+                actions = rank_complete_actions(
+                    model,
+                    state_emb[row : row + 1],
+                    row_logits,
+                    pool,
+                    id_to_tactic,
+                    top_k=5,
+                    tactic_k=tactic_k,
+                    tactic_filter=lambda tactic_id: tactic_id not in fresh_tactic_ids,
+                )
+                tactic_log_probs = F.log_softmax(row_logits, dim=0)
+                for fresh_tactic_id in fresh_tactic_ids:
+                    if not torch.isfinite(tactic_log_probs[fresh_tactic_id]):
+                        continue
+                    actions.append(
+                        rank_fresh_name_action(
+                            model,
+                            state_emb[row : row + 1],
+                            tactic_id=fresh_tactic_id,
+                            tactic_name=id_to_tactic[fresh_tactic_id],
+                            tactic_log_probability=float(
+                                tactic_log_probs[fresh_tactic_id].item()
+                            ),
+                            candidates=fresh_candidates,
+                            candidate_vectors=fresh_vectors,
+                        )
+                    )
+                actions.sort(key=lambda action: action.log_probability, reverse=True)
+                return actions[:5]
+
+            predicted_ranked_actions.append(ranked_for_logits(tactic_logits[row]))
+            oracle_logits = torch.full_like(tactic_logits[row], float("-inf"))
+            oracle_logits[targets[row]] = 0.0
+            oracle_ranked_actions.append(ranked_for_logits(oracle_logits, tactic_k=1))
 
         bs = int(targets.numel())
         total_tactic_loss += ta_metrics["tactic_loss"] * bs
         total_arg_loss += ta_metrics["arg_loss"] * bs
-        total_premise_loss += p_metrics["premise_loss"] * bs
+        total_premise_loss += p_metrics["reranking_loss"] * bs
         total_combined_loss += (
             ta_metrics["total_loss"]
-            + premise_loss_weight * p_metrics["premise_loss"]
+            + premise_loss_weight * p_metrics["reranking_loss"]
         ) * bs
-        premise_valid += p_metrics["valid_samples"]
-        premise_target_present += p_metrics["target_present_count"]
-        premise_top1_correct += p_metrics["top1_correct"]
-        premise_top5_correct += p_metrics["top5_correct"]
-        premise_mrr_sum += p_metrics["mrr_sum"]
+        reranking_target_count += int(p_metrics["target_count"])
+        reranking_scored_count += int(p_metrics["scored_target_count"])
+        reranking_unresolved_count += int(target_metrics["unresolved_target_count"])
+        reranking_top1_weighted += (
+            float(p_metrics["candidate_top1_accuracy"])
+            * int(p_metrics["scored_target_count"])
+        )
 
         # Tactic top-1 accuracy (excluding UNK)
         known_mask = targets != unknown_tactic_id
@@ -418,18 +596,60 @@ def evaluate_model_with_premises(
             )
 
     n = max(total_count, 1)
+    predicted_action_metrics = complete_action_metrics(
+        predicted_ranked_actions, action_targets, ks=(1, 5)
+    )
+    oracle_action_metrics = complete_action_metrics(
+        oracle_ranked_actions, action_targets, ks=(1, 5)
+    )
     return {
         "tactic_loss": total_tactic_loss / n,
         "arg_loss": total_arg_loss / n,
         "premise_loss": total_premise_loss / n,
         "combined_loss": total_combined_loss / n,
         "tactic_top1_accuracy": top1_correct / max(known_count, 1),
-        "premise_recall": premise_valid / max(premise_target_present, 1),
-        "premise_mrr": premise_mrr_sum / max(premise_valid, 1),
-        "premise_top1_accuracy": premise_top1_correct / max(premise_valid, 1),
-        "premise_top5_accuracy": premise_top5_correct / max(premise_valid, 1),
+        "reranking_target_coverage": reranking_scored_count
+        / max(reranking_target_count, 1),
+        "reranking_target_count": reranking_target_count,
+        "reranking_scored_target_count": reranking_scored_count,
+        "reranking_unresolved_target_count": reranking_unresolved_count,
+        "candidate_top1_accuracy": reranking_top1_weighted
+        / max(reranking_scored_count, 1),
+        "complete_action_exact_match_predicted_tactic": predicted_action_metrics[
+            "complete_action_exact_match"
+        ],
+        "complete_action_exact_match_oracle_tactic": oracle_action_metrics[
+            "complete_action_exact_match"
+        ],
+        "action_recall_at_1_predicted_tactic": predicted_action_metrics[
+            "action_recall_at_1"
+        ],
+        "action_recall_at_5_predicted_tactic": predicted_action_metrics[
+            "action_recall_at_5"
+        ],
+        "action_recall_at_1_oracle_tactic": oracle_action_metrics[
+            "action_recall_at_1"
+        ],
+        "action_recall_at_5_oracle_tactic": oracle_action_metrics[
+            "action_recall_at_5"
+        ],
+        "candidate_source_accuracy_predicted_tactic": predicted_action_metrics[
+            "candidate_source_accuracy"
+        ],
+        "candidate_source_accuracy_oracle_tactic": oracle_action_metrics[
+            "candidate_source_accuracy"
+        ],
+        "complete_action_per_tactic": predicted_action_metrics["per_tactic"],
+        "complete_action_labeled_count": len(action_targets),
+        # Compatibility aliases for old dashboards. These now describe the
+        # complete-action decoder rather than the retired one-premise scorer.
+        "premise_recall": reranking_scored_count / max(reranking_target_count, 1),
+        "premise_mrr": predicted_action_metrics["complete_action_exact_match"],
+        "premise_top1_accuracy": reranking_top1_weighted
+        / max(reranking_scored_count, 1),
+        "premise_top5_accuracy": predicted_action_metrics["action_recall_at_5"],
         "known_label_count": known_count,
-        "premise_target_present_count": premise_target_present,
-        "premise_valid_count": premise_valid,
+        "premise_target_present_count": reranking_target_count,
+        "premise_valid_count": reranking_scored_count,
         "evaluated_count": total_count,
     }

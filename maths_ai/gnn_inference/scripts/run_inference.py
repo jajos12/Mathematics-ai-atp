@@ -29,6 +29,10 @@ from atp_lean_gnn.training import (
 )
 from atp_lean_gnn.premise_scoring import PremiseScorer
 from atp_lean_gnn.lemma_corpus import load_lemma_corpus
+from atp_lean_gnn.unified_reranking import (
+    load_unified_reranker_weights,
+    verify_unified_reranker_dependencies,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=str, default=None, help="Path to config.json (e.g. from runs/baseline_gnn/run_*/config.json). Not needed with --bundle.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to best.pt checkpoint (backbone + tactic model). Not needed with --bundle.")
     parser.add_argument("--scorer-checkpoint", type=str, default=None, help="Path to a premise scorer checkpoint (best.pt from a premise_selection run). If omitted, the scorer uses random weights.")
+    parser.add_argument("--retriever-checkpoint", type=str, default=None, help="Path to best.pt from train_retriever. If omitted, the pointer backbone queries the index.")
     parser.add_argument("--index-path", type=str, help="Path to FAISS index. If missing, retrieval will return nothing.")
     parser.add_argument("--corpus-path", type=str, help="Path to lemmas.jsonl for decoding retrieved lemma IDs to names.")
     parser.add_argument("--k", type=int, default=500, help="Number of lemmas to retrieve")
@@ -58,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         model = loaded.model
         metadata = loaded.metadata
         hidden_dim = int(loaded.config.model.hidden_dim)
+        edge_mode = loaded.config.edge_mode
         scorer = loaded.scorer
         if loaded.randomly_initialized:
             print(
@@ -76,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
 
         config = load_baseline_config(config_path)
         hidden_dim = int(config.model.hidden_dim)
+        edge_mode = config.edge_mode
 
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
@@ -144,12 +151,39 @@ def main(argv: list[str] | None = None) -> int:
 
     model.eval()
 
+    retriever = None
+    if args.retriever_checkpoint:
+        from atp_lean_gnn.premise_retrieval import load_retriever_checkpoint
+
+        try:
+            retriever = load_retriever_checkpoint(
+                args.retriever_checkpoint,
+                pointer_backbone=model.backbone,
+                hidden_dim=hidden_dim,
+                node_vocab=metadata.node_vocab,
+                tactic_vocab=metadata.tactic_vocab,
+                device=device,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        print(f"Loaded retriever weights from {args.retriever_checkpoint}")
+
     # Build scorer and load trained weights
+    reranker_checkpoint = None
     if scorer is None:
         if args.scorer_checkpoint:
             scorer_ckpt_path = Path(args.scorer_checkpoint)
             if scorer_ckpt_path.exists():
                 scorer_ckpt = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
+                reranker_checkpoint = load_unified_reranker_weights(
+                    scorer_ckpt_path,
+                    model=model,
+                    node_vocab=metadata.node_vocab,
+                    tactic_vocab=metadata.tactic_vocab,
+                    expected_edge_mode=edge_mode,
+                    device=device,
+                )
                 # Checkpoints from train_scorer save under 'scorer_state_dict'
                 scorer_state = scorer_ckpt.get("scorer_state_dict", scorer_ckpt)
                 # The scoring mode is determined by the weights: only mode="mlp"
@@ -180,34 +214,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.index_path:
         index_path = Path(args.index_path)
         if index_path.exists():
-            from atp_lean_gnn.lemma_index import (
-                read_index_manifest,
-                load_index_for_encoder,
-            )
+            from atp_lean_gnn.lemma_index import load_index_for_encoder
 
-            manifest = read_index_manifest(index_path)
-            if manifest.get("encoder_state_sha256"):
-                # Verify the index was built by this model's encoder before
-                # retrieval runs: same dimensions but a different vector
-                # space returns plausible wrong premises with no error.
-                try:
-                    lemma_index = load_index_for_encoder(
-                        index_path,
-                        encoder_state_dict=model.state_dict(),
-                        node_vocab=metadata.node_vocab,
-                        tactic_vocab=metadata.tactic_vocab,
-                    )
-                except ValueError as exc:
-                    print(f"ERROR: {exc}")
-                    return 1
-            else:
-                # Pre-binding index: load, but say it is unverified.
-                print(
-                    "WARNING: index predates encoder binding (no "
-                    "encoder_state_sha256 in its manifest); loading it "
-                    "unverified. Rebuild it with build_lemma_index.py."
+            # A supplied index must be verified. Same dimensions but a
+            # different encoder space returns plausible wrong premises with no
+            # runtime error, so warning-and-loading is not a safe fallback.
+            try:
+                lemma_index = load_index_for_encoder(
+                    index_path,
+                    encoder_state_dict=(
+                        model.state_dict()
+                        if retriever is None
+                        else retriever.lemma_encoder.state_dict()
+                    ),
+                    node_vocab=metadata.node_vocab,
+                    tactic_vocab=metadata.tactic_vocab,
+                    corpus_path=args.corpus_path,
+                    expected_edge_mode=edge_mode,
                 )
-                lemma_index = LemmaIndex.load(index_path)
+            except ValueError as exc:
+                print(f"ERROR: {exc}")
+                return 1
             print(f"Loaded index with {len(lemma_index.lemma_ids)} lemmas.")
         else:
             print(f"WARNING: index path {index_path} not found.")
@@ -222,6 +249,15 @@ def main(argv: list[str] | None = None) -> int:
             lemma_ids=[],
             lemma_vectors=np.empty((0, d), dtype=np.float32)
         )
+    try:
+        verify_unified_reranker_dependencies(
+            reranker_checkpoint,
+            index_manifest=lemma_index.manifest,
+            retriever=retriever,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
     lemma_corpus = None
     if args.corpus_path:
@@ -243,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         k=args.k,
         lemma_corpus=lemma_corpus,
+        retriever=retriever,
+        edge_mode=edge_mode,
     )
 
     print("\n--- Input State ---")

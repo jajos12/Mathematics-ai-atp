@@ -3,7 +3,7 @@ from typing import List, Optional, cast
 
 import torch
 
-from maths_ai.data_models.proof_components import TacticCandidate
+from maths_ai.data_models.proof_components import StableArgumentRef, TacticCandidate
 from maths_ai.gnn_inference.atp_lean_gnn.bundle import (
     load_baseline_weights_into_pointer,
     load_pointer_bundle,
@@ -13,6 +13,11 @@ from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgs
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer
+from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import load_retriever_checkpoint
+from maths_ai.gnn_inference.atp_lean_gnn.unified_reranking import (
+    load_unified_reranker_weights,
+    verify_unified_reranker_dependencies,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     PreparedMetadata,
     detect_state_dict_model_type,
@@ -33,6 +38,7 @@ class GNNModelEngine:
         bundle_dir: Optional[Path] = None,
         index_path: Optional[Path] = None,
         corpus_path: Optional[Path] = None,
+        retriever_checkpoint_path: Optional[Path] = None,
         scorer_mode: Optional[str] = None,
         k: int = 500,
         device: str = "cuda",
@@ -59,6 +65,8 @@ class GNNModelEngine:
             index_path: optional path to a FAISS lemma index directory.
             corpus_path: optional path to lemmas.jsonl for decoding retrieved
                 lemma IDs.
+            retriever_checkpoint_path: optional trained proof-state query tower.
+                Its frozen lemma tower must match ``index_path``.
             scorer_mode: legacy override for the scorer's scoring mode. Left
                 unset it is recovered from the scorer's own weights, which is
                 always correct; passing it wrong silently changes the
@@ -67,7 +75,7 @@ class GNNModelEngine:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         if bundle_dir is not None:
-            tactic_model, argument_model, metadata, hidden_dim = self._load_from_bundle(
+            tactic_model, argument_model, metadata, hidden_dim, edge_mode = self._load_from_bundle(
                 Path(bundle_dir),
                 argument_predictor_model_path=argument_predictor_model_path,
                 scorer_mode=scorer_mode,
@@ -78,7 +86,7 @@ class GNNModelEngine:
                     "GNNModelEngine needs either bundle_dir, or both config_path and "
                     "tactic_predictor_model_path."
                 )
-            tactic_model, argument_model, metadata, hidden_dim = self._load_from_checkpoints(
+            tactic_model, argument_model, metadata, hidden_dim, edge_mode = self._load_from_checkpoints(
                 config_path=Path(config_path),
                 tactic_predictor_model_path=Path(tactic_predictor_model_path),
                 argument_predictor_model_path=(
@@ -89,8 +97,48 @@ class GNNModelEngine:
                 scorer_mode=scorer_mode,
             )
 
-        lemma_index = self._load_lemma_index(index_path, hidden_dim)
+        reranker_checkpoint = None
+        if argument_predictor_model_path is not None:
+            reranker_checkpoint = load_unified_reranker_weights(
+                argument_predictor_model_path,
+                model=tactic_model,
+                node_vocab=metadata.node_vocab,
+                tactic_vocab=metadata.tactic_vocab,
+                expected_edge_mode=edge_mode,
+                device=self.device,
+            )
+
+        retriever = (
+            None
+            if retriever_checkpoint_path is None
+            else load_retriever_checkpoint(
+                retriever_checkpoint_path,
+                pointer_backbone=tactic_model.backbone,
+                hidden_dim=hidden_dim,
+                node_vocab=metadata.node_vocab,
+                tactic_vocab=metadata.tactic_vocab,
+                device=self.device,
+            )
+        )
+        lemma_index = self._load_lemma_index(
+            index_path,
+            hidden_dim,
+            encoder_state_dict=(
+                tactic_model.state_dict()
+                if retriever is None
+                else retriever.lemma_encoder.state_dict()
+            ),
+            node_vocab=metadata.node_vocab,
+            tactic_vocab=metadata.tactic_vocab,
+            corpus_path=corpus_path,
+            expected_edge_mode=edge_mode,
+        )
         lemma_corpus = self._load_lemma_corpus(corpus_path)
+        verify_unified_reranker_dependencies(
+            reranker_checkpoint,
+            index_manifest=lemma_index.manifest,
+            retriever=retriever,
+        )
 
         self.gnn_inference = GNNPredictor(
             tactic_model=tactic_model,
@@ -101,6 +149,8 @@ class GNNModelEngine:
             device=self.device,
             k=k,
             lemma_corpus=lemma_corpus,
+            retriever=retriever,
+            edge_mode=edge_mode,
         )
 
     # ------------------------------------------------------------------
@@ -113,7 +163,7 @@ class GNNModelEngine:
         *,
         argument_predictor_model_path: Optional[Path],
         scorer_mode: Optional[str],
-    ) -> tuple[TacticWithArgsClassifier, PremiseScorer, PreparedMetadata, int]:
+    ) -> tuple[TacticWithArgsClassifier, PremiseScorer, PreparedMetadata, int, str]:
         # load_pointer_bundle wraps a baseline bundle into a pointer shell,
         # because InferencePipeline reaches through model.backbone and so cannot
         # accept a bare baseline.
@@ -150,7 +200,7 @@ class GNNModelEngine:
             ).to(self.device)
             argument_model.eval()
 
-        return tactic_model, argument_model, loaded.metadata, hidden_dim
+        return tactic_model, argument_model, loaded.metadata, hidden_dim, loaded.config.edge_mode
 
     def _load_from_checkpoints(
         self,
@@ -159,7 +209,7 @@ class GNNModelEngine:
         tactic_predictor_model_path: Path,
         argument_predictor_model_path: Optional[Path],
         scorer_mode: Optional[str],
-    ) -> tuple[TacticWithArgsClassifier, PremiseScorer, PreparedMetadata, int]:
+    ) -> tuple[TacticWithArgsClassifier, PremiseScorer, PreparedMetadata, int, str]:
         config = load_baseline_config(config_path)
         tactic_checkpoint = torch.load(
             tactic_predictor_model_path, map_location=self.device, weights_only=False
@@ -247,7 +297,7 @@ class GNNModelEngine:
             ).to(self.device)
             argument_model.eval()
 
-        return tactic_model, argument_model, metadata, hidden_dim
+        return tactic_model, argument_model, metadata, hidden_dim, config.edge_mode
 
     def _load_scorer_checkpoint(
         self,
@@ -281,9 +331,27 @@ class GNNModelEngine:
         return scorer
 
     @staticmethod
-    def _load_lemma_index(index_path: Optional[Path], hidden_dim: int) -> LemmaIndex:
+    def _load_lemma_index(
+        index_path: Optional[Path],
+        hidden_dim: int,
+        *,
+        encoder_state_dict,
+        node_vocab: dict[str, int],
+        tactic_vocab: dict[str, int],
+        corpus_path: Optional[Path],
+        expected_edge_mode: str,
+    ) -> LemmaIndex:
         if index_path is not None and Path(index_path).exists():
-            return LemmaIndex.load(index_path)
+            from .atp_lean_gnn.lemma_index import load_index_for_encoder
+
+            return load_index_for_encoder(
+                index_path,
+                encoder_state_dict=encoder_state_dict,
+                node_vocab=node_vocab,
+                tactic_vocab=tactic_vocab,
+                corpus_path=corpus_path,
+                expected_edge_mode=expected_edge_mode,
+            )
 
         import faiss
         import numpy as np
@@ -313,17 +381,30 @@ class GNNModelEngine:
         """
         predictions = self.gnn_inference.predict_tactics_with_arguments(goal_expression, top_k=top_k)
         print(*predictions, "\n")
-        result =  [
-            TacticCandidate(
-                tactic_name=str(prediction["tactic_name"]),
-                arguments=[str(argument) for argument in cast(list, prediction["selected_arguments"])],
-                probability=float(cast(float, prediction["probability"])),
+        result = []
+        for prediction in predictions:
+            details = cast(list, prediction.get("selected_argument_details", []))
+            result.append(
+                TacticCandidate(
+                    tactic_name=str(prediction["tactic_name"]),
+                    arguments=[
+                        str(argument)
+                        for argument in cast(list, prediction["selected_arguments"])
+                    ],
+                    argument_refs=[
+                        StableArgumentRef(
+                            source=str(detail.source),
+                            candidate_id=int(detail.candidate_id),
+                            graph_id=(0 if str(detail.source) in {"local", "fresh"} else None),
+                        )
+                        for detail in details
+                    ],
+                    probability=float(cast(float, prediction["probability"])),
+                )
             )
-            for prediction in predictions
-        ]
 
         for res in result:
             if res.tactic_name == "rw":
-                res.arguments = "[" + ",".join(res.arguments) + "]"
+                res.arguments = ["[" + ",".join(res.arguments) + "]"]
 
         return result

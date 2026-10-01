@@ -218,6 +218,48 @@ def frozen_index_embeddings(
     return torch.from_numpy(vectors).to(device=device)
 
 
+def load_or_build_hard_negative_index(
+    frozen_index,
+    cache_path: str | Path,
+    *,
+    connections: int = 16,
+    ef_search: int = 128,
+):
+    """Build a cached approximate index for repeated training-time mining."""
+    import faiss
+
+    from .lemma_index import LemmaIndex
+
+    path = Path(cache_path)
+    expected_count, dimension = frozen_index.lemma_vectors.shape
+    approximate = None
+    if path.exists():
+        candidate = faiss.read_index(str(path))
+        if int(candidate.ntotal) == expected_count and int(candidate.d) == dimension:
+            approximate = candidate
+    if approximate is None:
+        approximate = faiss.IndexHNSWFlat(
+            int(dimension), int(connections), faiss.METRIC_INNER_PRODUCT
+        )
+        approximate.hnsw.efConstruction = max(40, int(connections) * 2)
+        approximate.add(
+            np.ascontiguousarray(frozen_index.lemma_vectors, dtype=np.float32)
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f".{path.name}.tmp")
+        faiss.write_index(approximate, str(temporary_path))
+        temporary_path.replace(path)
+    approximate.hnsw.efSearch = int(ef_search)
+    return LemmaIndex(
+        approximate,
+        list(frozen_index.lemma_ids),
+        frozen_index.lemma_vectors,
+        lemma_names=list(frozen_index.lemma_names),
+        normalize_queries=True,
+        manifest=frozen_index.manifest,
+    )
+
+
 def combine_retrieval_candidates(
     positive_ids_per_query: Sequence[Sequence[int]],
     accessible_negative_ids: Sequence[Sequence[int]],
@@ -260,6 +302,7 @@ def train_retriever_epoch(
     hard_negative_count: int,
     grad_clip: float,
     rng: random.Random,
+    hard_negative_index=None,
 ) -> dict[str, int | float]:
     """Train state queries against encoded positives and three negative sources."""
     if not frozen_index.normalize_queries:
@@ -290,7 +333,7 @@ def train_retriever_epoch(
             continue
         state_embeddings = model.encode_states(batch)
         hard_rows = mine_hard_negative_ids(
-            frozen_index,
+            hard_negative_index or frozen_index,
             state_embeddings,
             positive_rows,
             k=hard_negative_count,

@@ -35,6 +35,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import DualEncoderRetriever
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
     evaluate_retriever,
+    load_or_build_hard_negative_index,
     train_retriever_epoch,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
@@ -135,6 +136,18 @@ def main(argv: list[str] | None = None) -> int:
             "retriever requires a normalized index; rebuild with "
             "build_lemma_index.py --normalize"
         )
+    hard_negative_index = None
+    index_input_path = Path(args.index_path)
+    hard_negative_index_path = (
+        index_input_path if index_input_path.is_dir() else index_input_path.parent
+    ) / "hard_negative_hnsw_m16.faiss"
+    if args.hard_negatives:
+        console_print(
+            f"Loading/building approximate hard-negative index at {hard_negative_index_path}..."
+        )
+        hard_negative_index = load_or_build_hard_negative_index(
+            index, hard_negative_index_path
+        )
 
     model = DualEncoderRetriever(
         copy.deepcopy(pointer.backbone),
@@ -176,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         "accessible_negative_policy": "import_Mathlib_environment",
         "index_policy": "frozen_lemma_tower",
         "candidate_embedding_policy": "precomputed_frozen_index_vectors",
+        "hard_negative_index_policy": "hnsw_m16_ef128",
         "seed": args.seed,
     }
     (run_dir / "config.json").write_text(
@@ -212,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             hard_negative_count=args.hard_negatives,
             grad_clip=args.grad_clip,
             rng=rng,
+            hard_negative_index=hard_negative_index,
         )
         val_metrics = evaluate_retriever(
             model, loaders["val"], index, device=device

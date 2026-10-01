@@ -23,6 +23,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
     combine_retrieval_candidates,
     evaluate_retriever,
     extract_external_positive_ids,
+    load_or_build_hard_negative_index,
     sample_accessible_unused_ids,
     train_retriever_epoch,
 )
@@ -315,6 +316,19 @@ def test_lemma_graph_store_uses_structural_state_root() -> None:
     )
     graph = store.graph(1)
     assert graph.state_node_index.tolist() == [root_id]
+
+
+def test_hard_negative_index_is_approximate_and_cached(tmp_path) -> None:
+    source = _NormalizedPriorIndex()
+    source.lemma_names = [str(value) for value in source.lemma_ids]
+    source.manifest = {"normalize": True}
+    cache_path = tmp_path / "hard.faiss"
+    first = load_or_build_hard_negative_index(source, cache_path, connections=4)
+    second = load_or_build_hard_negative_index(source, cache_path, connections=4)
+    assert cache_path.exists()
+    assert first.lemma_ids == source.lemma_ids
+    assert second.index.ntotal == len(source.lemma_ids)
+    assert second.normalize_queries
 
 
 def test_accessible_sampling_excludes_citations_and_is_deterministic() -> None:

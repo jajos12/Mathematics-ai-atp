@@ -52,6 +52,21 @@ class _PriorIndex:
 
 class _NormalizedPriorIndex(_PriorIndex):
     normalize_queries = True
+    id_to_position = {
+        lemma_id: position
+        for position, lemma_id in enumerate(_PriorIndex.lemma_ids)
+    }
+    lemma_vectors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],
+            [-0.5, 0.5, -0.5, 0.5],
+        ],
+        dtype=np.float32,
+    )
 
 
 class _TrainingBatch(SimpleNamespace):
@@ -62,16 +77,9 @@ class _TrainingBatch(SimpleNamespace):
         return self
 
 
-class _ToyLemmaStore:
-    lemma_ids = (10, 11, 12, 13, 14, 15)
-
+class _FailingLemmaStore:
     def batch(self, lemma_ids, *, device):
-        features = torch.tensor(
-            [[float(value == basis) for basis in (10, 11, 12, 13)] for value in lemma_ids],
-            dtype=torch.float32,
-            device=device,
-        )
-        return SimpleNamespace(features=features)
+        raise AssertionError("frozen lemma graphs must not be re-encoded")
 
 
 def test_dual_encoder_uses_separate_towers_and_normalizes() -> None:
@@ -360,7 +368,7 @@ def test_training_epoch_encodes_external_candidates_and_reports_sources() -> Non
     metrics = train_retriever_epoch(
         model,
         [batch],
-        _ToyLemmaStore(),
+        _FailingLemmaStore(),
         _NormalizedPriorIndex(),
         optimizer=optimizer,
         device=torch.device("cpu"),

@@ -8,6 +8,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim import Optimizer
 from torch_geometric.data import Batch
@@ -198,6 +199,25 @@ class RetrievalCandidates:
     hard_negative_count: int
 
 
+def frozen_index_embeddings(
+    frozen_index,
+    lemma_ids: Sequence[int],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Gather vectors already encoded by the frozen lemma tower."""
+    missing = [
+        int(value)
+        for value in lemma_ids
+        if int(value) not in frozen_index.id_to_position
+    ]
+    if missing:
+        raise ValueError(f"candidate lemma IDs are absent from the frozen index: {missing[:5]}")
+    positions = [frozen_index.id_to_position[int(value)] for value in lemma_ids]
+    vectors = np.asarray(frozen_index.lemma_vectors[positions], dtype=np.float32)
+    return torch.from_numpy(vectors).to(device=device)
+
+
 def combine_retrieval_candidates(
     positive_ids_per_query: Sequence[Sequence[int]],
     accessible_negative_ids: Sequence[Sequence[int]],
@@ -231,7 +251,7 @@ def combine_retrieval_candidates(
 def train_retriever_epoch(
     model: DualEncoderRetriever,
     loader,
-    lemma_store: LemmaGraphStore,
+    lemma_store: LemmaGraphStore | None,
     frozen_index,
     *,
     optimizer: Optimizer,
@@ -288,8 +308,20 @@ def train_retriever_epoch(
             query_count += len(positive_rows)
             continue
 
-        lemma_batch = lemma_store.batch(candidates.lemma_ids, device=device)
-        lemma_embeddings = model.encode_lemmas(lemma_batch)
+        if hasattr(frozen_index, "id_to_position") and hasattr(
+            frozen_index, "lemma_vectors"
+        ):
+            # Index vectors are exact outputs of the frozen lemma tower. Re-running
+            # that tower over thousands of dynamically parsed graphs per batch is
+            # mathematically redundant and dominates training time.
+            lemma_embeddings = frozen_index_embeddings(
+                frozen_index, candidates.lemma_ids, device=device
+            )
+        elif lemma_store is not None:
+            lemma_batch = lemma_store.batch(candidates.lemma_ids, device=device)
+            lemma_embeddings = model.encode_lemmas(lemma_batch)
+        else:
+            raise ValueError("frozen index does not expose vectors for candidate lookup")
         logits = model.similarity(state_embeddings, lemma_embeddings)
         positive_mask = build_positive_mask(
             candidates.lemma_ids, positive_rows, device=device

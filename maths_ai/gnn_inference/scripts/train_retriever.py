@@ -34,7 +34,6 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import (
 from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import DualEncoderRetriever
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
-    LemmaGraphStore,
     evaluate_retriever,
     train_retriever_epoch,
 )
@@ -82,7 +81,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--accessible-negatives", type=int, default=32)
     parser.add_argument("--hard-negatives", type=int, default=32)
-    parser.add_argument("--cache-size", type=int, default=4096)
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=4096,
+        help="Retained for CLI compatibility; frozen index vectors need no graph cache",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda")
@@ -145,12 +149,6 @@ def main(argv: list[str] | None = None) -> int:
     _, loaders = build_dataloaders(
         metadata, config, required_fields=required_fields
     )
-    lemma_store = LemmaGraphStore.from_corpus(
-        args.corpus_path,
-        node_vocab=metadata.node_vocab,
-        edge_mode=config.edge_mode,
-        cache_size=args.cache_size,
-    )
     optimizer = AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
@@ -177,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         # benchmark and is not claimed here.
         "accessible_negative_policy": "import_Mathlib_environment",
         "index_policy": "frozen_lemma_tower",
+        "candidate_embedding_policy": "precomputed_frozen_index_vectors",
         "seed": args.seed,
     }
     (run_dir / "config.json").write_text(
@@ -205,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         train_metrics = train_retriever_epoch(
             model,
             loaders["train"],
-            lemma_store,
+            None,
             index,
             optimizer=optimizer,
             device=device,

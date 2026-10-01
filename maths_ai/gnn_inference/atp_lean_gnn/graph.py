@@ -205,6 +205,8 @@ BINDER_KIND_LAMBDA = 3    # λ binder
 BINDER_KIND_LET = 4       # let binder
 BINDER_KIND_OTHER = 5     # other binder types
 
+STATE_NODE_POLICY = "root_state_v1"
+
 
 @dataclass(frozen=True)
 class GraphNode:
@@ -392,6 +394,17 @@ class DAGBuilder:
 
     def stats(self) -> GraphStats:
         return graph_stats(self)
+
+
+def root_state_node_id(dag: DAGBuilder) -> int:
+    """Return structural proof-state root, ignoring constants named ``State``."""
+    root_ids = {node.id for node in dag.root_nodes()}
+    candidates = [
+        node.id for node in dag.nodes if node.label == "State" and node.id in root_ids
+    ]
+    if len(candidates) != 1:
+        raise ValueError(f"expected one root State node, found {len(candidates)}")
+    return candidates[0]
 
 def graph_stats(dag: DAGBuilder) -> GraphStats:
     child_counts = dag.incoming_counts()

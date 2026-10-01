@@ -37,6 +37,7 @@ from .preparation import (
 from .pilot_sampling import load_selection_manifest, selected_row_indices
 from .labels import build_tactic_vocab, encode_tactic_name, label_example
 from .lemma_corpus import load_lemma_name_index
+from .graph import root_state_node_id
 from .pyg import build_vocab_from_labels, dag_to_pyg
 from .reporting import console_print
 
@@ -479,14 +480,9 @@ def process_split(
 
         # Materialize the readout node once. Older prepared datasets omit this
         # field and remain supported by PreparedGraphDataset's fallback.
-        state_node_ids = [node.id for node in dag.nodes if node.label == "State"]
-        source_node_ids = {source for source, _ in dag.edges}
-        root_state_ids = [node_id for node_id in state_node_ids if node_id not in source_node_ids]
-        if len(root_state_ids) != 1:
-            raise ValueError(
-                f"Expected exactly one root State node, found {len(root_state_ids)}."
-            )
-        data.state_node_index = torch.tensor(root_state_ids, dtype=torch.long)
+        data.state_node_index = torch.tensor(
+            [root_state_node_id(dag)], dtype=torch.long
+        )
 
         # --- Argument-selection ground truth (additive) ---------------
         premise_mask = build_premise_mask(dag)

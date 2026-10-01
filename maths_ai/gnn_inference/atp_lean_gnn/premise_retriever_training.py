@@ -12,7 +12,8 @@ import torch
 from torch.optim import Optimizer
 from torch_geometric.data import Batch
 
-from .graph import lemma_statement_to_dag
+from .graph import lemma_statement_to_dag, root_state_node_id
+from .labels import parse_tactic_arguments
 from .lemma_corpus import LemmaRecord, load_lemma_corpus
 from .premise_retrieval import (
     DualEncoderRetriever,
@@ -71,10 +72,9 @@ class LemmaGraphStore:
         try:
             dag = lemma_statement_to_dag(record.statement)
             data = dag_to_pyg(dag, self.node_vocab)
-            state_nodes = [node.id for node in dag.nodes if node.label == "State"]
-            if len(state_nodes) != 1:
-                raise ValueError(f"expected one State node, found {len(state_nodes)}")
-            data.state_node_index = torch.tensor(state_nodes, dtype=torch.long)
+            data.state_node_index = torch.tensor(
+                [root_state_node_id(dag)], dtype=torch.long
+            )
             data.edge_index = transform_edge_index(
                 data.edge_index, edge_mode=self.edge_mode
             )
@@ -107,7 +107,9 @@ class LemmaGraphStore:
         )
 
 
-def extract_external_positive_ids(batch) -> list[list[int]]:
+def extract_external_positive_ids(
+    batch, *, name_to_id: dict[str, int] | None = None
+) -> list[list[int]]:
     """Recover every trace-cited external lemma ID for each proof step."""
     batch_size = int(batch.y.numel()) if hasattr(batch, "y") else int(batch.num_graphs)
     if not hasattr(batch, "arg_count") or not hasattr(batch, "arg_lemma_ids"):
@@ -118,10 +120,30 @@ def extract_external_positive_ids(batch) -> list[list[int]]:
         raise ValueError("arg_count must contain one value per proof state")
     if sum(counts) != len(flat_ids):
         raise ValueError("arg_count does not match flattened arg_lemma_ids")
+    flat_local_ids = (
+        [int(value) for value in batch.arg_node_indices.view(-1).tolist()]
+        if hasattr(batch, "arg_node_indices")
+        else [-1] * len(flat_ids)
+    )
+    if len(flat_local_ids) != len(flat_ids):
+        raise ValueError("arg_node_indices must align with arg_lemma_ids")
+    raw_tactics = getattr(batch, "tactic_raw", [])
+    if isinstance(raw_tactics, str):
+        raw_tactics = [raw_tactics]
+    if raw_tactics and len(raw_tactics) != batch_size:
+        raise ValueError("tactic_raw must contain one value per proof state")
+
     result: list[list[int]] = []
     offset = 0
-    for count in counts:
+    for row_index, count in enumerate(counts):
         row = flat_ids[offset : offset + count]
+        local_row = flat_local_ids[offset : offset + count]
+        if name_to_id and raw_tactics:
+            _, argument_names = parse_tactic_arguments(str(raw_tactics[row_index]))
+            row = list(row)
+            for position, argument_name in enumerate(argument_names[:count]):
+                if row[position] < 0 and local_row[position] < 0:
+                    row[position] = int(name_to_id.get(argument_name, -1))
         result.append(list(dict.fromkeys(value for value in row if value >= 0)))
         offset += count
     return result
@@ -240,7 +262,12 @@ def train_retriever_epoch(
 
     for batch in loader:
         batch = batch.to(device)
-        positive_rows = extract_external_positive_ids(batch)
+        positive_rows = extract_external_positive_ids(
+            batch, name_to_id=getattr(frozen_index, "name_to_id", None)
+        )
+        if not any(positive_rows):
+            query_count += len(positive_rows)
+            continue
         state_embeddings = model.encode_states(batch)
         hard_rows = mine_hard_negative_ids(
             frozen_index,
@@ -320,5 +347,9 @@ def evaluate_retriever(
         queries = model.encode_states(batch)
         ranked_ids, _, _ = frozen_index.search(queries, k=max_k)
         ranked_rows.extend(ranked_ids)
-        positive_rows.extend(extract_external_positive_ids(batch))
+        positive_rows.extend(
+            extract_external_positive_ids(
+                batch, name_to_id=getattr(frozen_index, "name_to_id", None)
+            )
+        )
     return retrieval_metrics(ranked_rows, positive_rows, ks=ks).as_dict()

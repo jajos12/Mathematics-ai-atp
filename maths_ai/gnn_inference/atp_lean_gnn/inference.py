@@ -13,7 +13,13 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
-from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
+from .graph import (
+    DAGBuilder,
+    GraphNode,
+    goal_state_to_proof_state,
+    proof_state_to_dag,
+    root_state_node_id,
+)
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
 from .premise_pool import CandidateRef, CandidateSource, build_unified_pools
@@ -244,10 +250,7 @@ class InferencePipeline:
         """Core prediction logic from a pre-built DAG."""
         data = dag_to_pyg(dag, self.node_vocab)
         
-        try:
-            state_idx = next(i for i, n in enumerate(dag.nodes) if n.label == "State")
-        except StopIteration:
-            state_idx = 0
+        state_idx = root_state_node_id(dag)
         data.state_node_index = torch.tensor([state_idx], dtype=torch.long)
         
         premise_mask = build_premise_mask(dag)

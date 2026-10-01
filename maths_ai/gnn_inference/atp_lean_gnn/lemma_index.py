@@ -342,5 +342,12 @@ def load_index_for_encoder(
                 f"Lemma index '{index_dir}' uses edge_mode={index_edge_mode!r}, "
                 f"but the model uses {expected_edge_mode!r}."
             )
+    from .graph import STATE_NODE_POLICY
+
+    if manifest.get("state_node_policy") != STATE_NODE_POLICY:
+        raise ValueError(
+            f"Lemma index '{index_dir}' does not use the required structural "
+            f"State-root policy {STATE_NODE_POLICY!r}; rebuild it."
+        )
 
     return LemmaIndex.load(index_dir, manifest=manifest)

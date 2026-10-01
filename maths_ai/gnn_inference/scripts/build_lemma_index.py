@@ -19,7 +19,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, repo_root_str)
 
 
-from maths_ai.gnn_inference.atp_lean_gnn.graph import lemma_statement_to_dag
+from maths_ai.gnn_inference.atp_lean_gnn.graph import (
+    STATE_NODE_POLICY,
+    lemma_statement_to_dag,
+    root_state_node_id,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.bundle import file_sha256
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
@@ -81,10 +85,7 @@ def _load_config_from_checkpoint(
 
 
 def _state_node_id(dag) -> int:
-    for node in dag.nodes:
-        if node.label == "State":
-            return node.id
-    raise ValueError("Lemma DAG is missing the State node.")
+    return root_state_node_id(dag)
 
 
 def _iter_batches(items: list, batch_size: int) -> Iterable[list]:
@@ -228,6 +229,7 @@ def build_index(
         "tactic_vocab_sha256": stable_vocab_sha256(metadata.tactic_vocab),
         "config_path": None if config_path is None else config_path.name,
         "edge_mode": edge_mode,
+        "state_node_policy": STATE_NODE_POLICY,
         "batch_size": batch_size,
         "normalize": normalize,
         "hidden_dim": int(config.model.hidden_dim),

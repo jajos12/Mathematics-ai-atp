@@ -63,6 +63,7 @@ def verify_unified_reranker_dependencies(
         "corpus_sha256",
         "edge_mode",
         "normalize",
+        "state_node_policy",
     )
     if any(saved_manifest.get(key) != index_manifest.get(key) for key in binding_fields):
         raise ValueError("unified reranker was trained against a different lemma index")

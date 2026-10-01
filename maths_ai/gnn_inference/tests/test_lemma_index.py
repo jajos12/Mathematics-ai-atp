@@ -104,6 +104,7 @@ def _write_index_dir(
     import faiss
 
     from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import state_dict_sha256
+    from maths_ai.gnn_inference.atp_lean_gnn.graph import STATE_NODE_POLICY
 
     index_dir = root / "lemma_index_v1"
     index_dir.mkdir(parents=True)
@@ -121,6 +122,7 @@ def _write_index_dir(
         "node_vocab_sha256": _stable_vocab_sha256(node_vocab),
         "tactic_vocab_sha256": _stable_vocab_sha256(tactic_vocab),
         "normalize": normalize,
+        "state_node_policy": STATE_NODE_POLICY,
     }
     (index_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return index_dir
@@ -196,6 +198,14 @@ class LoadIndexForEncoderTests(unittest.TestCase):
         manifest.pop("node_vocab_sha256")
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "both vocabulary hashes"):
+            self._load()
+
+    def test_legacy_state_node_policy_is_refused(self) -> None:
+        manifest_path = self.index_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("state_node_policy")
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "structural State-root policy"):
             self._load()
 
     def test_different_lemma_corpus_is_refused(self) -> None:

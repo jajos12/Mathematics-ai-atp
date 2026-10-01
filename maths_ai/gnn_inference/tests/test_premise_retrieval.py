@@ -19,6 +19,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import (
     load_retriever_checkpoint,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
+    LemmaGraphStore,
     combine_retrieval_candidates,
     evaluate_retriever,
     extract_external_positive_ids,
@@ -267,6 +268,45 @@ def test_external_positive_extraction_preserves_multiple_citations() -> None:
         arg_lemma_ids=torch.tensor([10, -1, 12, 11]),
     )
     assert extract_external_positive_ids(batch) == [[10, 12], [11], []]
+
+
+def test_external_positive_extraction_recovers_legacy_missing_ids() -> None:
+    batch = SimpleNamespace(
+        y=torch.tensor([0]),
+        arg_count=torch.tensor([2]),
+        arg_lemma_ids=torch.tensor([-1, -1]),
+        arg_node_indices=torch.tensor([3, -1]),
+        tactic_raw=["rw [h, Nat.add_comm]"],
+    )
+    assert extract_external_positive_ids(
+        batch, name_to_id={"Nat.add_comm": 42}
+    ) == [[42]]
+
+
+def test_lemma_graph_store_uses_structural_state_root() -> None:
+    from maths_ai.gnn_inference.atp_lean_gnn.graph import (
+        lemma_statement_to_dag,
+        root_state_node_id,
+    )
+    from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
+
+    dag = lemma_statement_to_dag("State")
+    assert sum(node.label == "State" for node in dag.nodes) == 2
+    root_id = root_state_node_id(dag)
+    store = LemmaGraphStore(
+        [
+            LemmaRecord(
+                lemma_id=1,
+                name="Demo.state",
+                statement="State",
+                namespace="Demo",
+                module="Demo",
+            )
+        ],
+        node_vocab={"<UNK>": 0, "State": 1, "Goal": 2},
+    )
+    graph = store.graph(1)
+    assert graph.state_node_index.tolist() == [root_id]
 
 
 def test_accessible_sampling_excludes_citations_and_is_deterministic() -> None:

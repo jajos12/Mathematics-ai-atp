@@ -137,8 +137,8 @@ class InferenceDecodeTests(unittest.TestCase):
             )
         return pipeline, pool
 
-    def test_decode_selects_distinct_candidates_across_steps(self) -> None:
-        """Every complete-action beam uses each stable candidate at most once."""
+    def test_decode_selects_valid_candidates_across_steps(self) -> None:
+        """Every complete-action beam stays within the typed candidate pool."""
         pipeline, pool = self._build_pipeline(stop_bias=-10.0)
         result = pipeline.predict_tactic_result(STATE, top_k=3)
         self.assertEqual(len(result.top_tactic_predictions), 3)
@@ -146,9 +146,6 @@ class InferenceDecodeTests(unittest.TestCase):
         for candidate in result.top_tactic_predictions:
             details = candidate["selected_argument_details"]
             self.assertLessEqual(len(details), pipeline.model.max_args)
-            positions = [d.candidate_id for d in details]
-            # The same pool candidate must never be selected twice in one action.
-            self.assertEqual(len(positions), len(set(positions)))
             # Every decode step selected from the fake pool.
             for detail in details:
                 self.assertIn(detail.candidate_id, pool.candidate_ids)

@@ -112,7 +112,7 @@ def test_empty_pool_returns_stop_only_actions() -> None:
     assert all(action.arguments == () for action in actions)
 
 
-def test_multi_argument_actions_never_repeat_stable_candidates() -> None:
+def test_multi_argument_actions_support_repeated_stable_candidates() -> None:
     model = _model()
     with torch.no_grad():
         model.stop_head.weight.zero_()
@@ -121,22 +121,17 @@ def test_multi_argument_actions_never_repeat_stable_candidates() -> None:
         model,
         torch.randn(1, HIDDEN_DIM),
         torch.tensor([0.0, 4.0, 1.0, -1.0]),
-        _pool(
-            [
-                CandidateSource.LOCAL,
-                CandidateSource.LIBRARY,
-                CandidateSource.LIBRARY,
-            ]
-        ),
+        _pool([CandidateSource.LIBRARY]),
         {1: "rw"},
         top_k=10,
         tactic_k=1,
         beam_size=8,
     )
-    assert any(len(action.arguments) > 1 for action in actions)
-    for action in actions:
-        keys = [argument.key for argument in action.arguments]
-        assert len(keys) == len(set(keys))
+    assert any(
+        len(action.arguments) > 1
+        and len({argument.key for argument in action.arguments}) == 1
+        for action in actions
+    )
 
 
 def test_ordered_target_resolution_preserves_source_and_position() -> None:
@@ -185,6 +180,23 @@ def test_mixed_sequence_loss_trains_existing_pointer_and_stop_head() -> None:
     assert metrics["scored_target_count"] == 2
     assert model.argument_selector.gru.weight_ih.grad is not None
     assert model.stop_head.weight.grad is not None
+
+
+def test_repeated_candidate_sequence_contributes_to_reranking_loss() -> None:
+    model = _model()
+    model.train()
+    pool = _pool([CandidateSource.LIBRARY])
+    loss, metrics = compute_unified_reranking_loss(
+        model,
+        torch.randn(1, HIDDEN_DIM),
+        torch.tensor([1]),
+        [pool],
+        [[0, 0, 0]],
+    )
+    loss.backward()
+    assert metrics["target_coverage"] == 1.0
+    assert metrics["scored_target_count"] == 3
+    assert model.argument_selector.gru.weight_ih.grad is not None
 
 
 def test_unresolved_suffix_remains_in_coverage_denominator() -> None:

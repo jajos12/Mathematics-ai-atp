@@ -200,7 +200,6 @@ def compute_unified_reranking_loss(
         decoder_state = model.argument_selector.initial_state(
             state_embeddings[row : row + 1], tactic_embeddings[row : row + 1]
         )
-        selected: set[int] = set()
         sequence_resolved = True
         target_count += len(targets)
         for step, target_position in enumerate(targets):
@@ -219,17 +218,9 @@ def compute_unified_reranking_loss(
                     f"target pool position {target_position} is outside graph {row}'s "
                     f"{len(pool.candidates)} candidates"
                 )
-            if target_position in selected:
-                raise ValueError(
-                    f"argument position {step} repeats pool candidate {target_position}"
-                )
             scores = model.argument_selector.score_candidates(
                 decoder_state, pool.candidate_vectors
             ).squeeze(0)
-            if selected:
-                mask = torch.zeros_like(scores, dtype=torch.bool)
-                mask[list(selected)] = True
-                scores = scores.masked_fill(mask, float("-inf"))
             target = torch.tensor([target_position], device=scores.device)
             losses.append(F.cross_entropy(scores.unsqueeze(0), target))
             prediction = int(scores.argmax().item())
@@ -239,7 +230,6 @@ def compute_unified_reranking_loss(
                 is pool.candidates[target_position].source
             )
             scored_count += 1
-            selected.add(target_position)
             decoder_state = model.argument_selector.gru(
                 pool.candidate_vectors[target_position].unsqueeze(0), decoder_state
             )
@@ -373,15 +363,11 @@ def rank_complete_actions(
                         ),
                     )
                 )
-                if step == model.max_args or len(beam.positions) == len(allowed_positions):
+                if step == model.max_args or not allowed_positions:
                     continue
                 scores = model.argument_selector.score_candidates(
                     beam.decoder_state, pool.candidate_vectors
                 ).squeeze(0)
-                if beam.positions:
-                    mask = torch.zeros_like(scores, dtype=torch.bool)
-                    mask[list(beam.positions)] = True
-                    scores = scores.masked_fill(mask, float("-inf"))
                 if len(allowed_positions) != len(pool.candidates):
                     source_mask = torch.ones_like(scores, dtype=torch.bool)
                     source_mask[allowed_positions] = False

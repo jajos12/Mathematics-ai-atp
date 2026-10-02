@@ -23,7 +23,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
     combine_retrieval_candidates,
     evaluate_retriever,
     extract_external_positive_ids,
-    load_or_build_hard_negative_index,
+    load_or_build_hnsw_index,
     sample_accessible_unused_ids,
     train_retriever_epoch,
 )
@@ -323,8 +323,8 @@ def test_hard_negative_index_is_approximate_and_cached(tmp_path) -> None:
     source.lemma_names = [str(value) for value in source.lemma_ids]
     source.manifest = {"normalize": True}
     cache_path = tmp_path / "hard.faiss"
-    first = load_or_build_hard_negative_index(source, cache_path, connections=4)
-    second = load_or_build_hard_negative_index(source, cache_path, connections=4)
+    first = load_or_build_hnsw_index(source, cache_path, connections=4)
+    second = load_or_build_hnsw_index(source, cache_path, connections=4)
     assert cache_path.exists()
     assert first.lemma_ids == source.lemma_ids
     assert second.index.ntotal == len(source.lemma_ids)

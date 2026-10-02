@@ -34,6 +34,9 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import load_index_for_encod
 from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer, PremiseScorerConfig
 from maths_ai.gnn_inference.atp_lean_gnn.premise_training import evaluate_model_with_premises, train_one_epoch_with_premises
+from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
+    load_or_build_hnsw_index,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     build_dataloaders,
@@ -143,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         tactic_vocab=metadata.tactic_vocab,
         corpus_path=args.corpus_path,
         expected_edge_mode=config.edge_mode,
+    )
+    index_input_path = Path(args.index_path)
+    hnsw_path = (
+        index_input_path if index_input_path.is_dir() else index_input_path.parent
+    ) / "hard_negative_hnsw_m16.faiss"
+    lemma_index = load_or_build_hnsw_index(
+        lemma_index,
+        hnsw_path,
+        ef_search=max(256, int(p_config.k) * 2),
     )
     retriever = None
     if args.retriever_checkpoint:

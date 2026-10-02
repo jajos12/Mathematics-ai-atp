@@ -613,6 +613,21 @@ def run_scorer(config: dict[str, Any]) -> dict[str, Any]:
                 corpus_path=corpus_path,
                 expected_edge_mode=p_config.edge_mode,
             )
+            from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
+                load_or_build_hnsw_index,
+            )
+
+            index_input_path = Path(lemma_index_file)
+            hnsw_path = (
+                index_input_path
+                if index_input_path.is_dir()
+                else index_input_path.parent
+            ) / "hard_negative_hnsw_m16.faiss"
+            lemma_index = load_or_build_hnsw_index(
+                lemma_index,
+                hnsw_path,
+                ef_search=max(256, int(p_config_obj.k) * 2),
+            )
         except ValueError as exc:
             console_print(f"  ERROR: {exc}")
             return {"error": "lemma index does not match its encoder"}

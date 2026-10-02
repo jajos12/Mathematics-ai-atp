@@ -35,7 +35,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import DualEncoderRetriever
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
     evaluate_retriever,
-    load_or_build_hard_negative_index,
+    load_or_build_hnsw_index,
     train_retriever_epoch,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         console_print(
             f"Loading/building approximate hard-negative index at {hard_negative_index_path}..."
         )
-        hard_negative_index = load_or_build_hard_negative_index(
+        hard_negative_index = load_or_build_hnsw_index(
             index, hard_negative_index_path
         )
 

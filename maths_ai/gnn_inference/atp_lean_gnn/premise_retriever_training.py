@@ -218,14 +218,14 @@ def frozen_index_embeddings(
     return torch.from_numpy(vectors).to(device=device)
 
 
-def load_or_build_hard_negative_index(
+def load_or_build_hnsw_index(
     frozen_index,
     cache_path: str | Path,
     *,
     connections: int = 16,
     ef_search: int = 128,
 ):
-    """Build a cached approximate index for repeated training-time mining."""
+    """Build a cached approximate index over bound frozen lemma vectors."""
     import faiss
 
     from .lemma_index import LemmaIndex

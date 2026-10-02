@@ -31,11 +31,11 @@ from maths_ai.gnn_inference.atp_lean_gnn.unified_reranking import (
 HIDDEN_DIM = 8
 
 
-def _model() -> TacticWithArgsClassifier:
+def _model(*, num_tactics: int = 4) -> TacticWithArgsClassifier:
     torch.manual_seed(0)
     model = TacticWithArgsClassifier(
         num_node_labels=10,
-        num_tactics=4,
+        num_tactics=num_tactics,
         hidden_dim=HIDDEN_DIM,
         num_layers=1,
         max_args=3,
@@ -110,6 +110,45 @@ def test_empty_pool_returns_stop_only_actions() -> None:
     )
     assert len(actions) == 3
     assert all(action.arguments == () for action in actions)
+
+
+def test_top_five_pruning_matches_exhaustive_action_ranking() -> None:
+    from unittest.mock import patch
+
+    model = _model(num_tactics=30)
+    pool = _pool([CandidateSource.LOCAL, CandidateSource.LIBRARY])
+    logits = torch.linspace(10, -20, 30)
+    state = torch.randn(1, HIDDEN_DIM)
+    names = {tactic_id: str(tactic_id) for tactic_id in range(30)}
+    with patch.object(
+        model.argument_selector,
+        "initial_state",
+        wraps=model.argument_selector.initial_state,
+    ) as initial_state:
+        pruned = rank_complete_actions(
+            model, state, logits, pool, names, top_k=5, beam_size=4,
+        )
+        assert initial_state.call_count < len(logits)
+    exhaustive = rank_complete_actions(
+        model, state, logits, pool, names, top_k=30 * 13, beam_size=4,
+    )
+    assert pruned == exhaustive[:5]
+
+
+def test_top_five_pruning_preserves_tactic_filter() -> None:
+    model = _model(num_tactics=15)
+    pool = _pool([CandidateSource.LIBRARY])
+    logits = torch.linspace(5, -9, 15)
+    state = torch.randn(1, HIDDEN_DIM)
+    filtered = lambda tactic_id: tactic_id % 2 == 0
+    pruned = rank_complete_actions(
+        model, state, logits, pool, {}, top_k=5, tactic_filter=filtered,
+    )
+    exhaustive = rank_complete_actions(
+        model, state, logits, pool, {}, top_k=15 * 25,
+        tactic_filter=filtered,
+    )
+    assert pruned == exhaustive[:5]
 
 
 def test_multi_argument_actions_support_repeated_stable_candidates() -> None:

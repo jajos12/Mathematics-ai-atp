@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Sequence
 from collections.abc import Callable
+import heapq
 from pathlib import Path
 
 import torch
@@ -323,9 +324,19 @@ def rank_complete_actions(
     )
     tactic_log_probs = F.log_softmax(logits, dim=0)
     tactic_ids = tactic_log_probs.topk(tactic_limit).indices.tolist()
-    complete: list[RankedAction] = []
+    best_by_key: dict[tuple, RankedAction] = {}
 
     for tactic_id in tactic_ids:
+        tactic_log_probability = float(tactic_log_probs[tactic_id].item())
+        if len(best_by_key) >= top_k:
+            cutoff = heapq.nlargest(
+                top_k, (action.log_probability for action in best_by_key.values())
+            )[-1]
+            # Stop + candidate log probabilities cannot increase the tactic's
+            # log probability. Remaining tactics have no higher tactic score.
+            # Strict inequality preserves equal-score/tie behavior.
+            if tactic_log_probability < cutoff:
+                break
         if tactic_filter is not None and not tactic_filter(tactic_id):
             continue
         allowed_positions = [
@@ -343,26 +354,27 @@ def rank_complete_actions(
             _Beam(
                 decoder_state=initial_state,
                 positions=(),
-                log_probability=float(tactic_log_probs[tactic_id].item()),
+                log_probability=tactic_log_probability,
             )
         ]
         for step in range(model.max_args + 1):
             next_beams: list[_Beam] = []
             for beam in beams:
                 stop_logit = model.stop_head(beam.decoder_state).view(())
-                complete.append(
-                    RankedAction(
-                        tactic_id=tactic_id,
-                        tactic_name=id_to_tactic.get(tactic_id, "<UNK>"),
-                        arguments=tuple(
-                            pool.candidates[position] for position in beam.positions
-                        ),
-                        log_probability=(
-                            beam.log_probability
-                            + float(F.logsigmoid(stop_logit).item())
-                        ),
-                    )
+                action = RankedAction(
+                    tactic_id=tactic_id,
+                    tactic_name=id_to_tactic.get(tactic_id, "<UNK>"),
+                    arguments=tuple(
+                        pool.candidates[position] for position in beam.positions
+                    ),
+                    log_probability=(
+                        beam.log_probability
+                        + float(F.logsigmoid(stop_logit).item())
+                    ),
                 )
+                previous = best_by_key.get(action.stable_key)
+                if previous is None or action.log_probability > previous.log_probability:
+                    best_by_key[action.stable_key] = action
                 if step == model.max_args or not allowed_positions:
                     continue
                 scores = model.argument_selector.score_candidates(
@@ -399,13 +411,6 @@ def rank_complete_actions(
             if not beams:
                 break
 
-    # Different beam paths cannot produce the same typed sequence, but tactic
-    # loops can when a pool is empty. Deduplicate by stable action identity.
-    best_by_key: dict[tuple, RankedAction] = {}
-    for action in complete:
-        previous = best_by_key.get(action.stable_key)
-        if previous is None or action.log_probability > previous.log_probability:
-            best_by_key[action.stable_key] = action
     return sorted(
         best_by_key.values(), key=lambda action: action.log_probability, reverse=True
     )[:top_k]

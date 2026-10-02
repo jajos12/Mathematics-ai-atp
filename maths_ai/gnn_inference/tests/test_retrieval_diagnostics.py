@@ -2,6 +2,7 @@
 
 import torch
 from torch_geometric.data import Data
+from pathlib import Path
 
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import retrieval_metrics
@@ -9,7 +10,11 @@ from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     PremiseBM25,
     lexical_tokens,
 )
-from maths_ai.gnn_inference.scripts.diagnose_retriever import _oov_stats
+from maths_ai.gnn_inference.atp_lean_gnn.training import load_pointer_config
+from maths_ai.gnn_inference.scripts.diagnose_retriever import (
+    _diagnostic_config,
+    _oov_stats,
+)
 
 
 def test_bm25_ranks_matching_names_and_types_on_original_ids() -> None:
@@ -37,3 +42,13 @@ def test_oov_stats_reports_unknown_node_and_graph_rates() -> None:
         "unknown_fraction": 0.5,
         "graphs_with_unknown": 1,
     }
+
+
+def test_diagnostic_preserves_packed_cache_for_graph_budget() -> None:
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "pointer_gat_state_mean_attention_pretrained.json"
+    config = load_pointer_config(config_path)
+    diagnostic = _diagnostic_config(config, "/tmp/prepared")
+    assert diagnostic.training.max_batch_nodes == config.training.max_batch_nodes
+    assert diagnostic.training.max_batch_edges == config.training.max_batch_edges
+    assert diagnostic.training.cache_in_memory is True
+    assert diagnostic.training.num_workers == 0

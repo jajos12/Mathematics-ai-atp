@@ -70,6 +70,16 @@ def _oov_stats(graphs: list, *, unknown_id: int) -> dict[str, float | int]:
     }
 
 
+def _diagnostic_config(config, prepared_root: str):
+    # Graph-budget sampling needs the packed in-memory cache. Preserve both
+    # settings to evaluate the same validation rows as retriever training.
+    return replace(
+        config,
+        prepared_root=Path(prepared_root),
+        training=replace(config.training, num_workers=0, pin_memory=False),
+    ).normalized()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.max_queries is not None and args.max_queries < 1:
@@ -78,10 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--graph-samples must be positive and --failure-examples nonnegative")
     device = resolve_device(args.device)
     config = load_pointer_config(args.config, device_override=args.device)
-    config = replace(
-        config, prepared_root=Path(args.prepared_root),
-        training=replace(config.training, num_workers=0, pin_memory=False, cache_in_memory=False),
-    ).normalized()
+    config = _diagnostic_config(config, args.prepared_root)
     metadata = load_prepared_metadata(config.prepared_root)
     saved = torch.load(args.checkpoint, map_location=device, weights_only=False)
     pointer_state = saved.get("model_state_dict", saved)
@@ -102,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
         tactic_vocab=metadata.tactic_vocab, device=device,
     )
     del pointer, saved
+    _, loaders = build_dataloaders(
+        metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS + ("arg_lemma_ids", "arg_count"),
+    )
     records = load_lemma_corpus(args.corpus_path)
     indexed = [record for record in records if record.lemma_id in index.id_to_position]
     if len(indexed) != len(index.lemma_ids):
@@ -114,9 +124,6 @@ def main(argv: list[str] | None = None) -> int:
     lemma_graphs = [dag_to_pyg(lemma_statement_to_dag(record.statement), metadata.node_vocab) for record in graph_records]
     unknown_id = metadata.node_vocab["<UNK>"]
     id_to_label = {value: label for label, value in metadata.node_vocab.items()}
-    _, loaders = build_dataloaders(
-        metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS + ("arg_lemma_ids", "arg_count"),
-    )
     gnn_rows: list[list[int]] = []
     lexical_rows: list[list[int]] = []
     positive_rows: list[list[int]] = []

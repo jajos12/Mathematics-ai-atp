@@ -129,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     id_to_label = {value: label for label, value in metadata.node_vocab.items()}
     gnn_rows: list[list[int]] = []
     lexical_rows: list[list[int]] = []
+    bm25_gold_ranks: list[int | None] = []
     positive_rows: list[list[int]] = []
     failures: list[dict[str, object]] = []
     failure_count = 0
@@ -154,9 +155,13 @@ def main(argv: list[str] | None = None) -> int:
             for node_id in node_ids:
                 if node_id != unknown_id:
                     tokens.update(lexical_tokens(id_to_label[int(node_id)]))
-            bm25_ids = lexical.search(tokens, k=200)
+            bm25_ids, gold_rank = lexical.search_with_gold_rank(
+                tokens, gold_ids, k=200
+            )
             gnn_rows.append(gnn_ids)
             lexical_rows.append(bm25_ids)
+            if gold_ids:
+                bm25_gold_ranks.append(gold_rank)
             positive_rows.append(gold_ids)
             row_count += 1
             if gold_ids and not set(gold_ids).intersection(gnn_ids):
@@ -214,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
         list(dict.fromkeys([*bm25, *gnn]))
         for bm25, gnn in zip(lexical_rows, gnn_rows)
     ]
+    bm25_recall_curve = {
+        f"recall_at_{k}": sum(
+            rank is not None and rank <= k for rank in bm25_gold_ranks
+        ) / max(len(bm25_gold_ranks), 1)
+        for k in (1, 10, 50, 200, 1000, 5000)
+    }
     report = {
         "config": {"index_path": args.index_path, "corpus_path": args.corpus_path,
                    "retriever_checkpoint": args.retriever_checkpoint, "seed": args.seed,
@@ -229,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
                                     "unknown_fraction": labeled_unknown / max(labeled_nodes, 1)},
         "gnn": retrieval_metrics(gnn_rows, positive_rows).as_dict(),
         "bm25": retrieval_metrics(lexical_rows, positive_rows).as_dict(),
+        "bm25_gold_rank_curve": {
+            "labeled_query_count": len(bm25_gold_ranks),
+            **bm25_recall_curve,
+            "gold_without_lexical_overlap": bm25_gold_ranks.count(None),
+        },
         "hybrid_150_bm25_50_gnn": retrieval_metrics(hybrid_150_50, positive_rows).as_dict(),
         "hybrid_180_bm25_20_gnn": retrieval_metrics(hybrid_180_20, positive_rows).as_dict(),
         "hybrid_rrf_200": retrieval_metrics(fused, positive_rows).as_dict(),
@@ -245,7 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Results saved to {output}\n" + json.dumps({
         key: report[key] for key in (
             "lemma_graph_oov_sample", "gold_lemma_graph_oov_sample",
-            "state_graph_oov", "gnn", "bm25", "hybrid_150_bm25_50_gnn",
+            "state_graph_oov", "gnn", "bm25", "bm25_gold_rank_curve",
+            "hybrid_150_bm25_50_gnn",
             "hybrid_180_bm25_20_gnn", "hybrid_rrf_200",
             "union_up_to_400_upper_bound", "top_200_labeled_hit_overlap",
             "gnn_top_200_failure_count",

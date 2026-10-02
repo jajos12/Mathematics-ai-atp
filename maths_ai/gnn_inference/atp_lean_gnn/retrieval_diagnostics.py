@@ -25,6 +25,9 @@ class PremiseBM25:
 
     def __init__(self, records: Sequence[LemmaRecord]) -> None:
         self.ids = [record.lemma_id for record in records]
+        self.id_to_position = {
+            lemma_id: position for position, lemma_id in enumerate(self.ids)
+        }
         self.lengths: list[int] = []
         self.postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for position, record in enumerate(records):
@@ -34,12 +37,12 @@ class PremiseBM25:
                 self.postings[token].append((position, frequency))
         self.average_length = sum(self.lengths) / max(len(records), 1)
 
-    def search(self, query_tokens: Iterable[str], *, k: int) -> list[int]:
-        if k < 1:
-            raise ValueError("k must be positive")
+    def _scores(self, query_tokens: Iterable[str]) -> dict[int, float]:
         scores: dict[int, float] = defaultdict(float)
         count = len(self.ids)
-        for token in set(query_tokens):
+        # Stable token order prevents rounding differences for close BM25 scores
+        # when Python starts with a different hash seed.
+        for token in sorted(set(query_tokens)):
             hits = self.postings.get(token, ())
             if not hits:
                 continue
@@ -47,12 +50,55 @@ class PremiseBM25:
             for position, frequency in hits:
                 norm = 1.2 * (0.25 + 0.75 * self.lengths[position] / max(self.average_length, 1))
                 scores[position] += idf * frequency * 2.2 / (frequency + norm)
+        return scores
+
+    def search(self, query_tokens: Iterable[str], *, k: int) -> list[int]:
+        if k < 1:
+            raise ValueError("k must be positive")
+        scores = self._scores(query_tokens)
         return [
             self.ids[position]
             for position in heapq.nlargest(
                 k, scores, key=lambda position: (scores[position], -position)
             )
         ]
+
+    def search_with_gold_rank(
+        self, query_tokens: Iterable[str], positive_ids: Iterable[int], *, k: int
+    ) -> tuple[list[int], int | None]:
+        """Top-K plus exact first gold rank without materializing top 5,000.
+
+        Only documents sharing at least one token are scored by BM25. A gold
+        document without lexical overlap has no rank in this retrieval policy.
+        """
+        if k < 1:
+            raise ValueError("k must be positive")
+        scores = self._scores(query_tokens)
+        top_ids = [
+            self.ids[position]
+            for position in heapq.nlargest(
+                k, scores, key=lambda position: (scores[position], -position)
+            )
+        ]
+        positive_set = set(positive_ids)
+        for rank, lemma_id in enumerate(top_ids, start=1):
+            if lemma_id in positive_set:
+                return top_ids, rank
+        gold_positions = (
+            self.id_to_position[lemma_id]
+            for lemma_id in positive_set
+            if lemma_id in self.id_to_position
+        )
+        best_gold = max(
+            ((scores[position], -position) for position in gold_positions if position in scores),
+            default=None,
+        )
+        if best_gold is None:
+            return top_ids, None
+        rank = 1 + sum(
+            (score, -position) > best_gold for position, score in scores.items()
+        )
+        return top_ids, rank
 
 
 def hybrid_top_k(

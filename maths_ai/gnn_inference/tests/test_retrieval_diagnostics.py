@@ -29,6 +29,12 @@ def test_bm25_ranks_matching_names_and_types_on_original_ids() -> None:
     baseline = PremiseBM25(records)
     assert lexical_tokens("Nat.add_comm") == ["nat", "add", "comm"]
     assert baseline.search(lexical_tokens("Nat.add_comm"), k=3)[0] == 17
+    top_ids, rank = baseline.search_with_gold_rank(
+        lexical_tokens("Nat.add_comm"), [17], k=2
+    )
+    assert top_ids == baseline.search(lexical_tokens("Nat.add_comm"), k=2)
+    assert rank == 1
+    assert baseline.search_with_gold_rank(["missing"], [17], k=2) == ([], None)
     assert retrieval_metrics([baseline.search(["add"], k=2)], [[17]]).as_dict()["recall_at_200"] == 1.0
     assert baseline.search(["notincorpus"], k=10) == []
 
@@ -70,3 +76,21 @@ def test_rank_fusion_and_hit_overlap_use_same_labeled_rows() -> None:
         [[1], [8], [9], [7], [5]],
         [[1], [2], [9], [6], []],
     ) == {"both": 1, "bm25_only": 1, "gnn_only": 1, "neither": 1}
+
+
+def test_gold_rank_matches_full_bm25_order_with_ties_and_multiple_positives() -> None:
+    records = [
+        LemmaRecord(index, f"lemma_{index}", "common" if index < 300 else "rare", "", "")
+        for index in range(320)
+    ]
+    bm25 = PremiseBM25(records)
+    for positives in ([275], [310], [275, 310], [999]):
+        top, rank = bm25.search_with_gold_rank(["common"], positives, k=10)
+        full = bm25.search(["common"], k=320)
+        assert top == full[:10]
+        expected = next(
+            (i for i, lemma_id in enumerate(full, start=1) if lemma_id in positives),
+            None,
+        )
+        assert rank == expected
+    assert bm25.search_with_gold_rank(["rare"], [315], k=10)[1] == 16

@@ -178,6 +178,48 @@ def test_retriever_checkpoint_rejects_different_vocab(tmp_path) -> None:
         )
 
 
+def test_retriever_training_resume_restores_optimizer_and_overrides_lr(tmp_path) -> None:
+    from maths_ai.gnn_inference.scripts.train_retriever import _restore_resume_state
+
+    model = DualEncoderRetriever(_ToyEncoder(4), _ToyEncoder(4), hidden_dim=4)
+    model.freeze_lemma_tower()
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1e-4,
+        weight_decay=1e-4,
+    )
+    checkpoint_path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "epoch": 10,
+            "model_type": "dual_encoder_retriever",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "node_vocab": {"State": 1},
+            "tactic_vocab": {"<UNK>": 0},
+        },
+        checkpoint_path,
+    )
+    with torch.no_grad():
+        model.state_projection.weight.zero_()
+    restored = _restore_resume_state(
+        checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        node_vocab={"State": 1},
+        tactic_vocab={"<UNK>": 0},
+        learning_rate=5e-5,
+        weight_decay=2e-4,
+        device=torch.device("cpu"),
+    )
+    assert restored["epoch"] == 10
+    assert optimizer.param_groups[0]["lr"] == 5e-5
+    assert optimizer.param_groups[0]["weight_decay"] == 2e-4
+    assert not torch.equal(
+        model.state_projection.weight, torch.zeros_like(model.state_projection.weight)
+    )
+
+
 def test_multi_positive_info_nce_rewards_either_positive() -> None:
     positives = torch.tensor([[True, True, False], [False, False, False]])
     good_logits = torch.tensor([[4.0, 3.0, -2.0], [1.0, 2.0, 3.0]], requires_grad=True)

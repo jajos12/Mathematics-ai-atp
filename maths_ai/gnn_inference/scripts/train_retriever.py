@@ -61,6 +61,30 @@ def _create_run_dir(run_root: Path) -> Path:
     return candidate
 
 
+def _restore_resume_state(
+    checkpoint_path: Path,
+    *,
+    model: DualEncoderRetriever,
+    optimizer: AdamW,
+    node_vocab: dict[str, int],
+    tactic_vocab: dict[str, int],
+    learning_rate: float,
+    weight_decay: float,
+    device: torch.device,
+) -> dict[str, object]:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint.get("model_type") != "dual_encoder_retriever":
+        raise ValueError(f"'{checkpoint_path}' is not a retriever checkpoint")
+    if checkpoint.get("node_vocab") != node_vocab or checkpoint.get("tactic_vocab") != tactic_vocab:
+        raise ValueError("resume checkpoint vocabularies do not match the pointer model")
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    for parameter_group in optimizer.param_groups:
+        parameter_group["lr"] = learning_rate
+        parameter_group["weight_decay"] = weight_decay
+    return checkpoint
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a proof-state/lemma dual-encoder retriever."
@@ -75,6 +99,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus-path", required=True, help="Mathlib lemma corpus")
     parser.add_argument(
         "--run-root", default="runs/premise_retriever", help="Output run directory"
+    )
+    parser.add_argument(
+        "--resume-run-dir",
+        default=None,
+        help="Continue an existing run from last.pt, or best.pt for older runs",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -168,7 +197,13 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
     )
 
-    run_dir = _create_run_dir(Path(args.run_root))
+    run_dir = (
+        Path(args.resume_run_dir).expanduser().resolve()
+        if args.resume_run_dir
+        else _create_run_dir(Path(args.run_root))
+    )
+    if args.resume_run_dir and not run_dir.is_dir():
+        raise FileNotFoundError(f"resume run directory '{run_dir}' does not exist")
     logger = TrainingLogger(run_dir)
     run_config = {
         "pointer_config": config.to_dict(),
@@ -190,17 +225,72 @@ def main(argv: list[str] | None = None) -> int:
         "index_policy": "frozen_lemma_tower",
         "candidate_embedding_policy": "precomputed_frozen_index_vectors",
         "hard_negative_index_policy": "hnsw_m16_ef128",
+        "resume_seed_policy": "seed_plus_epoch",
         "seed": args.seed,
     }
+    start_epoch = 1
+    best_mrr = -1.0
+    resume_checkpoint = None
+    if args.resume_run_dir:
+        resume_path = run_dir / "last.pt"
+        if not resume_path.exists():
+            resume_path = run_dir / "best.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"resume run '{run_dir}' has neither last.pt nor best.pt"
+            )
+        resume_checkpoint = _restore_resume_state(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            node_vocab=metadata.node_vocab,
+            tactic_vocab=metadata.tactic_vocab,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            device=device,
+        )
+        saved_config = resume_checkpoint.get("config", {})
+        saved_manifest = (
+            saved_config.get("index_manifest", {})
+            if isinstance(saved_config, dict)
+            else {}
+        )
+        current_manifest = read_index_manifest(args.index_path)
+        for key in (
+            "encoder_state_sha256",
+            "node_vocab_sha256",
+            "tactic_vocab_sha256",
+            "corpus_sha256",
+            "edge_mode",
+            "normalize",
+            "state_node_policy",
+        ):
+            if saved_manifest.get(key) != current_manifest.get(key):
+                raise ValueError(f"resume checkpoint index binding differs at {key}")
+        start_epoch = int(resume_checkpoint["epoch"]) + 1
+        best_checkpoint_path = run_dir / "best.pt"
+        best_checkpoint = (
+            torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
+            if best_checkpoint_path.exists()
+            else resume_checkpoint
+        )
+        best_mrr = float(best_checkpoint["val_metrics"]["mrr"])
+        baseline_metrics = dict(resume_checkpoint["pointer_index_baseline"])
+        run_config["resumed_from"] = resume_path.name
+        run_config["resume_start_epoch"] = start_epoch
+    else:
+        baseline_metrics = evaluate_retriever(
+            model, loaders["val"], index, device=device
+        )
+        (run_dir / "pointer_index_baseline.json").write_text(
+            json.dumps(baseline_metrics, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    if start_epoch > args.epochs:
+        raise ValueError(
+            f"run already reached epoch {start_epoch - 1}; --epochs must be at least {start_epoch}"
+        )
     (run_dir / "config.json").write_text(
         json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
-    )
-
-    baseline_metrics = evaluate_retriever(
-        model, loaders["val"], index, device=device
-    )
-    (run_dir / "pointer_index_baseline.json").write_text(
-        json.dumps(baseline_metrics, indent=2, sort_keys=True), encoding="utf-8"
     )
     console_print(
         "Pointer-index baseline | "
@@ -212,9 +302,12 @@ def main(argv: list[str] | None = None) -> int:
         f"MRR={baseline_metrics['mrr']:.4f}"
     )
 
-    best_mrr = -1.0
-    rng = random.Random(args.seed)
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        torch.manual_seed(args.seed + epoch)
+        batch_sampler = getattr(loaders["train"], "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(epoch)
+        rng = random.Random(args.seed + epoch)
         train_metrics = train_retriever_epoch(
             model,
             loaders["train"],
@@ -250,30 +343,29 @@ def main(argv: list[str] | None = None) -> int:
         }
         logger.log_epoch(epoch, log_metrics)
 
+        checkpoint_payload = {
+            "epoch": epoch,
+            "model_type": "dual_encoder_retriever",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": run_config,
+            "val_metrics": val_metrics,
+            "pointer_index_baseline": baseline_metrics,
+            "state_encoder_sha256": state_dict_sha256(
+                model.state_encoder.state_dict()
+            ),
+            "lemma_encoder_sha256": state_dict_sha256(
+                model.lemma_encoder.state_dict()
+            ),
+            "node_vocab": metadata.node_vocab,
+            "tactic_vocab": metadata.tactic_vocab,
+        }
+        torch.save(checkpoint_payload, run_dir / "last.pt")
         if float(val_metrics["mrr"]) > best_mrr:
             best_mrr = float(val_metrics["mrr"])
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_type": "dual_encoder_retriever",
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": run_config,
-                    "val_metrics": val_metrics,
-                    "pointer_index_baseline": baseline_metrics,
-                    "state_encoder_sha256": state_dict_sha256(
-                        model.state_encoder.state_dict()
-                    ),
-                    "lemma_encoder_sha256": state_dict_sha256(
-                        model.lemma_encoder.state_dict()
-                    ),
-                    "node_vocab": metadata.node_vocab,
-                    "tactic_vocab": metadata.tactic_vocab,
-                },
-                run_dir / "best.pt",
-            )
+            torch.save(checkpoint_payload, run_dir / "best.pt")
 
-    best_run_link = Path(args.run_root) / "best_run"
+    best_run_link = run_dir.parent / "best_run"
     if best_run_link.exists() or best_run_link.is_symlink():
         best_run_link.unlink()
     best_run_link.symlink_to(run_dir.name)

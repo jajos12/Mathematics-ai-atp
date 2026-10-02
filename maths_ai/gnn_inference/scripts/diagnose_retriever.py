@@ -36,7 +36,10 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     PremiseBM25,
+    hit_overlap,
+    hybrid_top_k,
     lexical_tokens,
+    reciprocal_rank_fusion,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     REQUIRED_POINTER_DATA_FIELDS,
@@ -195,6 +198,22 @@ def main(argv: list[str] | None = None) -> int:
         dag_to_pyg(lemma_statement_to_dag(by_id[lemma_id].statement), metadata.node_vocab)
         for lemma_id in sampled_gold
     ]
+    hybrid_150_50 = [
+        hybrid_top_k(bm25, gnn, k=200, bm25_quota=150)
+        for bm25, gnn in zip(lexical_rows, gnn_rows)
+    ]
+    hybrid_180_20 = [
+        hybrid_top_k(bm25, gnn, k=200, bm25_quota=180)
+        for bm25, gnn in zip(lexical_rows, gnn_rows)
+    ]
+    fused = [
+        reciprocal_rank_fusion(bm25, gnn, k=200)
+        for bm25, gnn in zip(lexical_rows, gnn_rows)
+    ]
+    union = [
+        list(dict.fromkeys([*bm25, *gnn]))
+        for bm25, gnn in zip(lexical_rows, gnn_rows)
+    ]
     report = {
         "config": {"index_path": args.index_path, "corpus_path": args.corpus_path,
                    "retriever_checkpoint": args.retriever_checkpoint, "seed": args.seed,
@@ -210,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
                                     "unknown_fraction": labeled_unknown / max(labeled_nodes, 1)},
         "gnn": retrieval_metrics(gnn_rows, positive_rows).as_dict(),
         "bm25": retrieval_metrics(lexical_rows, positive_rows).as_dict(),
+        "hybrid_150_bm25_50_gnn": retrieval_metrics(hybrid_150_50, positive_rows).as_dict(),
+        "hybrid_180_bm25_20_gnn": retrieval_metrics(hybrid_180_20, positive_rows).as_dict(),
+        "hybrid_rrf_200": retrieval_metrics(fused, positive_rows).as_dict(),
+        "union_up_to_400_upper_bound": retrieval_metrics(
+            union, positive_rows, ks=(1, 10, 50, 200, 400)
+        ).as_dict(),
+        "top_200_labeled_hit_overlap": hit_overlap(lexical_rows, gnn_rows, positive_rows),
         "gnn_top_200_failure_count": failure_count,
         "gnn_top_200_failures": failures,
     }
@@ -219,7 +245,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Results saved to {output}\n" + json.dumps({
         key: report[key] for key in (
             "lemma_graph_oov_sample", "gold_lemma_graph_oov_sample",
-            "state_graph_oov", "gnn", "bm25", "gnn_top_200_failure_count",
+            "state_graph_oov", "gnn", "bm25", "hybrid_150_bm25_50_gnn",
+            "hybrid_180_bm25_20_gnn", "hybrid_rrf_200",
+            "union_up_to_400_upper_bound", "top_200_labeled_hit_overlap",
+            "gnn_top_200_failure_count",
         )
     }, indent=2), flush=True)
     return 0

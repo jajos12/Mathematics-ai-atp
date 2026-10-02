@@ -53,3 +53,64 @@ class PremiseBM25:
                 k, scores, key=lambda position: (scores[position], -position)
             )
         ]
+
+
+def hybrid_top_k(
+    bm25_ids: Sequence[int],
+    gnn_ids: Sequence[int],
+    *,
+    k: int,
+    bm25_quota: int,
+) -> list[int]:
+    """Fill fixed candidate budget with BM25 first, then distinct GNN hits."""
+    if k < 1 or not 0 <= bm25_quota <= k:
+        raise ValueError("k must be positive and bm25_quota must lie in [0, k]")
+    combined = list(dict.fromkeys(bm25_ids[:bm25_quota]))
+    seen = set(combined)
+    for source in (gnn_ids, bm25_ids[bm25_quota:]):
+        for lemma_id in source:
+            if lemma_id not in seen:
+                combined.append(lemma_id)
+                seen.add(lemma_id)
+            if len(combined) == k:
+                return combined
+    return combined
+
+
+def reciprocal_rank_fusion(
+    bm25_ids: Sequence[int], gnn_ids: Sequence[int], *, k: int, constant: int = 60
+) -> list[int]:
+    """Combine both rank orders without using validation labels or fitted weights."""
+    if k < 1 or constant < 1:
+        raise ValueError("k and constant must be positive")
+    scores: dict[int, float] = defaultdict(float)
+    for ranking in (bm25_ids, gnn_ids):
+        for rank, lemma_id in enumerate(dict.fromkeys(ranking), start=1):
+            scores[lemma_id] += 1 / (constant + rank)
+    return heapq.nlargest(k, scores, key=lambda lemma_id: scores[lemma_id])
+
+
+def hit_overlap(
+    bm25_rows: Sequence[Sequence[int]],
+    gnn_rows: Sequence[Sequence[int]],
+    positive_rows: Sequence[Sequence[int]],
+) -> dict[str, int]:
+    """Partition labeled queries by retrieval hit in either top-200 pool."""
+    if not len(bm25_rows) == len(gnn_rows) == len(positive_rows):
+        raise ValueError("rankings and positives must have equal row counts")
+    counts = {"both": 0, "bm25_only": 0, "gnn_only": 0, "neither": 0}
+    for bm25, gnn, positives in zip(bm25_rows, gnn_rows, positive_rows):
+        if not positives:
+            continue
+        gold = set(positives)
+        bm25_hit = bool(gold.intersection(bm25))
+        gnn_hit = bool(gold.intersection(gnn))
+        if bm25_hit and gnn_hit:
+            counts["both"] += 1
+        elif bm25_hit:
+            counts["bm25_only"] += 1
+        elif gnn_hit:
+            counts["gnn_only"] += 1
+        else:
+            counts["neither"] += 1
+    return counts

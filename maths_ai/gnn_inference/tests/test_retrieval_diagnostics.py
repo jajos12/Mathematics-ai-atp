@@ -8,7 +8,10 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import retrieval_metrics
 from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     PremiseBM25,
+    hit_overlap,
+    hybrid_top_k,
     lexical_tokens,
+    reciprocal_rank_fusion,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import load_pointer_config
 from maths_ai.gnn_inference.scripts.diagnose_retriever import (
@@ -52,3 +55,18 @@ def test_diagnostic_preserves_packed_cache_for_graph_budget() -> None:
     assert diagnostic.training.max_batch_edges == config.training.max_batch_edges
     assert diagnostic.training.cache_in_memory is True
     assert diagnostic.training.num_workers == 0
+
+
+def test_fixed_budget_hybrid_retains_distinct_gnn_candidates() -> None:
+    assert hybrid_top_k([1, 2, 3, 4], [2, 9, 10, 11], k=4, bm25_quota=2) == [1, 2, 9, 10]
+    assert hybrid_top_k([1, 2, 3], [1, 2], k=4, bm25_quota=2) == [1, 2, 3]
+    assert len(hybrid_top_k(list(range(200)), list(range(100, 300)), k=200, bm25_quota=150)) == 200
+
+
+def test_rank_fusion_and_hit_overlap_use_same_labeled_rows() -> None:
+    assert reciprocal_rank_fusion([1, 2], [2, 3], k=3)[0] == 2
+    assert hit_overlap(
+        [[1], [2], [3], [4], [5]],
+        [[1], [8], [9], [7], [5]],
+        [[1], [2], [9], [6], []],
+    ) == {"both": 1, "bm25_only": 1, "gnn_only": 1, "neither": 1}

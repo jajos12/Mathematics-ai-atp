@@ -190,3 +190,18 @@ def hit_overlap(
         else:
             counts["neither"] += 1
     return counts
+
+
+def text_graph_hit_overlap(
+    text_rows: Sequence[Sequence[int]],
+    graph_rows: Sequence[Sequence[int]],
+    positive_rows: Sequence[Sequence[int]],
+) -> dict[str, int]:
+    """Name hit categories for text-vs-graph queries, not BM25-vs-GNN."""
+    counts = hit_overlap(text_rows, graph_rows, positive_rows)
+    return {
+        "both": counts["both"],
+        "text_only": counts["bm25_only"],
+        "graph_only": counts["gnn_only"],
+        "neither": counts["neither"],
+    }

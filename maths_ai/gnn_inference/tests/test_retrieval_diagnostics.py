@@ -17,6 +17,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     lexical_tokens,
     load_cached_state_text,
     reciprocal_rank_fusion,
+    text_graph_hit_overlap,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import load_pointer_config
 from maths_ai.gnn_inference.scripts.diagnose_retriever import (
@@ -161,3 +162,11 @@ def test_original_row_index_undoes_pyg_node_offsets() -> None:
     batch = Batch.from_data_list(graphs)
     assert batch.row_index.tolist() == [33, 37, 158]
     assert [_original_row_index(batch, row) for row in range(3)] == [33, 34, 150]
+
+
+def test_text_graph_overlap_names_which_query_hit() -> None:
+    assert text_graph_hit_overlap(
+        [[1], [2], [3], [4]],
+        [[1], [8], [9], [7]],
+        [[1], [2], [9], [6]],
+    ) == {"both": 1, "text_only": 1, "graph_only": 1, "neither": 1}

@@ -42,6 +42,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     lexical_tokens,
     load_cached_state_text,
     reciprocal_rank_fusion,
+    text_graph_hit_overlap,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     REQUIRED_POINTER_DATA_FIELDS,
@@ -330,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 "gold_without_lexical_overlap": text_gold_ranks.count(None),
                 "state_without_lexical_tokens": text_without_tokens,
             },
-            "text_vs_graph_bm25_top_200_hit_overlap": hit_overlap(
+            "text_vs_graph_bm25_top_200_hit_overlap": text_graph_hit_overlap(
                 text_rows, lexical_rows, positive_rows
             ),
         } if args.text_source != "none" else {}),

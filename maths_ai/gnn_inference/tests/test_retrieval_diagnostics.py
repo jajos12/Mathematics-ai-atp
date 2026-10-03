@@ -3,6 +3,10 @@
 import torch
 from torch_geometric.data import Data
 from pathlib import Path
+import json
+from types import SimpleNamespace
+
+import pytest
 
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import retrieval_metrics
@@ -11,11 +15,13 @@ from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     hit_overlap,
     hybrid_top_k,
     lexical_tokens,
+    load_cached_state_text,
     reciprocal_rank_fusion,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import load_pointer_config
 from maths_ai.gnn_inference.scripts.diagnose_retriever import (
     _diagnostic_config,
+    _load_text_states,
     _oov_stats,
 )
 
@@ -94,3 +100,54 @@ def test_gold_rank_matches_full_bm25_order_with_ties_and_multiple_positives() ->
         )
         assert rank == expected
     assert bm25.search_with_gold_rank(["rare"], [315], k=10)[1] == 16
+
+
+def test_raw_text_join_validates_original_row_identity(tmp_path) -> None:
+    data = SimpleNamespace(
+        row_index=7, theorem="Nat.demo", tactic_raw="rw [Nat.add_comm]",
+        dataset_name="demo/dataset",
+    )
+    cache = tmp_path / "val" / "sexpr"
+    cache.mkdir(parents=True)
+    path = cache / "000000007.json"
+    payload = {
+        "schema_version": 4, "dataset": data.dataset_name,
+        "split": "val", "row_index": 7, "theorem": data.theorem,
+        "tactic": data.tactic_raw, "text_state": "n : Nat\n⊢ n + 0 = n",
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert load_cached_state_text(tmp_path, data) == payload["text_state"]
+    args = SimpleNamespace(text_source="raw-cache", prepared_root=str(tmp_path))
+    assert _load_text_states(args, [data]) == {7: payload["text_state"]}
+    payload["tactic"] = "exact Nat.add_comm"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="differs at tactic"):
+        load_cached_state_text(tmp_path, data)
+
+
+def test_missing_raw_text_cache_fails_with_upstream_fallback(tmp_path) -> None:
+    data = SimpleNamespace(row_index=2)
+    with pytest.raises(FileNotFoundError, match="--text-source upstream"):
+        load_cached_state_text(tmp_path, data)
+
+
+def test_upstream_text_join_checks_row_identity(monkeypatch) -> None:
+    from maths_ai.gnn_inference.scripts import diagnose_retriever
+
+    data = SimpleNamespace(
+        row_index=7, theorem="Nat.demo", tactic_raw="rw [Nat.add_comm]",
+        dataset_name="demo/dataset",
+    )
+    row = SimpleNamespace(
+        row_index=7, theorem=data.theorem, tactic=data.tactic_raw,
+        dataset_name=data.dataset_name, state="⊢ Nat.add n m = Nat.add m n",
+    )
+    monkeypatch.setattr(
+        diagnose_retriever, "iter_dataset_rows",
+        lambda **kwargs: iter([SimpleNamespace(row_index=0), row]),
+    )
+    args = SimpleNamespace(text_source="upstream", dataset_name="demo/dataset")
+    assert _load_text_states(args, [data]) == {7: row.state}
+    row.tactic = "exact Nat.add_comm"
+    with pytest.raises(ValueError, match="does not match prepared graph"):
+        _load_text_states(args, [data])

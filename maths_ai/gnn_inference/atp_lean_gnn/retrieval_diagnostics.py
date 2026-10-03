@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import heapq
+import json
 import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 from .lemma_corpus import LemmaRecord
 
@@ -18,6 +20,34 @@ _STRUCTURAL = frozenset({"state", "goal", "hyp", "app", "forall", "lambda", "unk
 def lexical_tokens(text: str) -> list[str]:
     """Split qualified names and snake case, retaining type identifiers."""
     return [token for token in _TOKEN.findall(text.lower()) if token not in _STRUCTURAL]
+
+
+def load_cached_state_text(prepared_root: str | Path, data, *, split: str = "val") -> str:
+    """Recover real pre-tactic state only from matching extractor cache row."""
+    row_index = int(data.row_index)
+    path = Path(prepared_root) / split / "sexpr" / f"{row_index:09d}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Source text cache '{path}' is missing; use --text-source upstream "
+            "to stream the original benchmark instead"
+        )
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or record.get("schema_version") != 4:
+        raise ValueError(f"Source text cache '{path}' has an invalid schema")
+    expected = {
+        "dataset": str(data.dataset_name),
+        "split": split,
+        "row_index": row_index,
+        "theorem": str(data.theorem),
+        "tactic": str(data.tactic_raw),
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise ValueError(f"Source text cache '{path}' differs at {key}")
+    state = record.get("text_state")
+    if not isinstance(state, str) or not state.strip():
+        raise ValueError(f"Source text cache '{path}' has no pre-tactic state")
+    return state
 
 
 class PremiseBM25:

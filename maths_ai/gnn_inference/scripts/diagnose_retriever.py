@@ -1,9 +1,9 @@
-"""Compare exact-index retrieval and lexical BM25 on identical validation rows.
+"""Compare exact-index GNN, graph-label BM25 and optional state-text BM25.
 
-BM25 uses identifiers from prepared graph nodes as query text because prepared
-PyG artifacts do not retain the original pretty-printed proof state. Its
-documents contain declaration name + type. This is a reproducible *lexical*
-control, not the text-to-text BM25 setup of ReProver.
+Prepared PyG graphs do not store original proof-state text. In text mode,
+recover it from validated extractor records or stream the original benchmark.
+Both BM25 queries rank identical declaration name + type documents; neither
+is a reproduction of ReProver's trained dense retriever.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(repo_root))
 
 from maths_ai.gnn_inference.atp_lean_gnn.bundle import load_state_dict_checked
+from maths_ai.gnn_inference.atp_lean_gnn.dataset import DATASET_NAME, iter_dataset_rows
 from maths_ai.gnn_inference.atp_lean_gnn.graph import lemma_statement_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import load_index_for_encoder
@@ -39,6 +40,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     hit_overlap,
     hybrid_top_k,
     lexical_tokens,
+    load_cached_state_text,
     reciprocal_rank_fusion,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
@@ -60,6 +62,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graph-samples", type=int, default=2048)
     parser.add_argument("--failure-examples", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--text-source", choices=("none", "raw-cache", "upstream"), default="none",
+        help="Compare original pre-tactic text against graph labels; raw-cache reads prepared/val/sexpr",
+    )
+    parser.add_argument(
+        "--dataset-name", default=DATASET_NAME,
+        help="Upstream benchmark to stream when --text-source upstream is selected",
+    )
     return parser
 
 
@@ -81,6 +91,36 @@ def _diagnostic_config(config, prepared_root: str):
         prepared_root=Path(prepared_root),
         training=replace(config.training, num_workers=0, pin_memory=False),
     ).normalized()
+
+
+def _load_text_states(args, val_dataset) -> dict[int, str]:
+    """Join original states to prepared examples by verified split/row identity."""
+    if args.text_source == "none":
+        return {}
+    examples = {int(data.row_index): data for data in val_dataset}
+    if len(examples) != len(val_dataset):
+        raise ValueError("Validation prepared graphs contain repeated row_index values")
+    if args.text_source == "raw-cache":
+        return {
+            row_index: load_cached_state_text(args.prepared_root, data)
+            for row_index, data in examples.items()
+        }
+    states: dict[int, str] = {}
+    for row in iter_dataset_rows(dataset_name=args.dataset_name, split="val"):
+        data = examples.get(row.row_index)
+        if data is None:
+            continue
+        if (row.theorem != str(data.theorem) or row.tactic != str(data.tactic_raw)
+                or row.dataset_name != str(data.dataset_name)):
+            raise ValueError(f"Upstream validation row {row.row_index} does not match prepared graph")
+        if not row.state.strip():
+            raise ValueError(f"Upstream validation row {row.row_index} has no state text")
+        states[row.row_index] = row.state
+        if len(states) == len(examples):
+            break
+    if len(states) != len(examples):
+        raise ValueError(f"Upstream dataset has {len(states)}/{len(examples)} prepared validation rows")
+    return states
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,9 +152,10 @@ def main(argv: list[str] | None = None) -> int:
         tactic_vocab=metadata.tactic_vocab, device=device,
     )
     del pointer, saved
-    _, loaders = build_dataloaders(
+    datasets, loaders = build_dataloaders(
         metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS + ("arg_lemma_ids", "arg_count"),
     )
+    text_states = _load_text_states(args, datasets["val"])
     records = load_lemma_corpus(args.corpus_path)
     indexed = [record for record in records if record.lemma_id in index.id_to_position]
     if len(indexed) != len(index.lemma_ids):
@@ -130,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     gnn_rows: list[list[int]] = []
     lexical_rows: list[list[int]] = []
     bm25_gold_ranks: list[int | None] = []
+    text_rows: list[list[int]] = []
+    text_gold_ranks: list[int | None] = []
+    text_without_tokens = 0
     positive_rows: list[list[int]] = []
     failures: list[dict[str, object]] = []
     failure_count = 0
@@ -158,6 +202,15 @@ def main(argv: list[str] | None = None) -> int:
             bm25_ids, gold_rank = lexical.search_with_gold_rank(
                 tokens, gold_ids, k=200
             )
+            if args.text_source != "none":
+                text_tokens = set(lexical_tokens(text_states[int(batch.row_index[row])]))
+                text_without_tokens += int(not text_tokens)
+                text_ids, text_rank = lexical.search_with_gold_rank(
+                    text_tokens, gold_ids, k=200
+                )
+                text_rows.append(text_ids)
+                if gold_ids:
+                    text_gold_ranks.append(text_rank)
             gnn_rows.append(gnn_ids)
             lexical_rows.append(bm25_ids)
             if gold_ids:
@@ -183,10 +236,15 @@ def main(argv: list[str] | None = None) -> int:
                     "gold": [{"id": lemma_id, "name": by_id[lemma_id].name,
                               "type": by_id[lemma_id].statement[:250],
                               "gnn_rank_top_200": gnn_ids.index(lemma_id) + 1 if lemma_id in gnn_ids else None,
-                              "bm25_rank_top_200": bm25_ids.index(lemma_id) + 1 if lemma_id in bm25_ids else None}
+                              "bm25_rank_top_200": bm25_ids.index(lemma_id) + 1 if lemma_id in bm25_ids else None,
+                              "text_bm25_rank_top_200": (
+                                  text_ids.index(lemma_id) + 1 if lemma_id in text_ids else None
+                              ) if args.text_source != "none" else None}
                              for lemma_id in gold_ids if lemma_id in by_id],
                     "gnn_top_5": [by_id[lemma_id].name for lemma_id in gnn_ids[:5] if lemma_id in by_id],
                     "bm25_top_5": [by_id[lemma_id].name for lemma_id in bm25_ids[:5] if lemma_id in by_id],
+                    "text_bm25_top_5": [by_id[lemma_id].name for lemma_id in text_ids[:5] if lemma_id in by_id]
+                    if args.text_source != "none" else None,
                 }
                 if slot == len(failures):
                     failures.append(example)
@@ -229,7 +287,13 @@ def main(argv: list[str] | None = None) -> int:
         "config": {"index_path": args.index_path, "corpus_path": args.corpus_path,
                    "retriever_checkpoint": args.retriever_checkpoint, "seed": args.seed,
                    "max_queries": args.max_queries,
+                   "text_source": args.text_source,
+                   "text_dataset": args.dataset_name if args.text_source == "upstream" else None,
                    "bm25_query": "unique graph node-label tokens (no original state text stored)",
+                   "text_bm25_query": (
+                       "original pre-tactic proof-state text"
+                       if args.text_source != "none" else None
+                   ),
                    "bm25_documents": "declaration name + type, full exact-index corpus",
                    "bm25_k1": 1.2, "bm25_b": 0.75},
         "lemma_graph_oov_sample": _oov_stats(lemma_graphs, unknown_id=unknown_id),
@@ -245,6 +309,23 @@ def main(argv: list[str] | None = None) -> int:
             **bm25_recall_curve,
             "gold_without_lexical_overlap": bm25_gold_ranks.count(None),
         },
+        **({
+            "text_bm25": retrieval_metrics(text_rows, positive_rows).as_dict(),
+            "text_bm25_gold_rank_curve": {
+                "labeled_query_count": len(text_gold_ranks),
+                **{
+                    f"recall_at_{k}": sum(
+                        rank is not None and rank <= k for rank in text_gold_ranks
+                    ) / max(len(text_gold_ranks), 1)
+                    for k in (1, 10, 50, 200, 1000, 5000)
+                },
+                "gold_without_lexical_overlap": text_gold_ranks.count(None),
+                "state_without_lexical_tokens": text_without_tokens,
+            },
+            "text_vs_graph_bm25_top_200_hit_overlap": hit_overlap(
+                text_rows, lexical_rows, positive_rows
+            ),
+        } if args.text_source != "none" else {}),
         "hybrid_150_bm25_50_gnn": retrieval_metrics(hybrid_150_50, positive_rows).as_dict(),
         "hybrid_180_bm25_20_gnn": retrieval_metrics(hybrid_180_20, positive_rows).as_dict(),
         "hybrid_rrf_200": retrieval_metrics(fused, positive_rows).as_dict(),
@@ -258,15 +339,21 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Results saved to {output}\n" + json.dumps({
-        key: report[key] for key in (
+    summary_keys = (
             "lemma_graph_oov_sample", "gold_lemma_graph_oov_sample",
             "state_graph_oov", "gnn", "bm25", "bm25_gold_rank_curve",
             "hybrid_150_bm25_50_gnn",
             "hybrid_180_bm25_20_gnn", "hybrid_rrf_200",
             "union_up_to_400_upper_bound", "top_200_labeled_hit_overlap",
             "gnn_top_200_failure_count",
+    )
+    if args.text_source != "none":
+        summary_keys += (
+            "text_bm25", "text_bm25_gold_rank_curve",
+            "text_vs_graph_bm25_top_200_hit_overlap",
         )
+    print(f"Results saved to {output}\n" + json.dumps({
+        key: report[key] for key in summary_keys
     }, indent=2), flush=True)
     return 0
 

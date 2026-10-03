@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import random
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
@@ -205,3 +206,126 @@ def text_graph_hit_overlap(
         "graph_only": counts["gnn_only"],
         "neither": counts["neither"],
     }
+
+
+def text_miss_category(
+    rank: int | None, query_tokens: Iterable[str], gold_records: Sequence[LemmaRecord]
+) -> dict[str, object]:
+    """Describe gold-term overlap and rank for a missed text-BM25 step."""
+    if rank is not None and rank <= 200:
+        raise ValueError("text_miss_category requires a miss at K=200")
+    if not gold_records:
+        raise ValueError("text_miss_category requires cited declarations")
+    if rank is None:
+        bucket = "no_lexical_overlap"
+    elif rank <= 1000:
+        bucket = "rank_201_to_1000"
+    elif rank <= 5000:
+        bucket = "rank_1001_to_5000"
+    else:
+        bucket = "rank_above_5000"
+    query = set(query_tokens)
+    name_overlap = query & set().union(
+        *(set(lexical_tokens(record.name)) for record in gold_records)
+    )
+    type_overlap = query & set().union(
+        *(set(lexical_tokens(record.statement)) for record in gold_records)
+    )
+    return {
+        "rank_bucket": bucket,
+        "query_token_count": len(query),
+        "shared_name_terms": sorted(name_overlap),
+        "shared_type_terms": sorted(type_overlap),
+    }
+
+
+class TextMissAnalysis:
+    """Stratified sample and denominator-preserving summary of BM25 misses."""
+
+    def __init__(self, *, seed: int, examples_per_bucket: int = 8) -> None:
+        if examples_per_bucket < 0:
+            raise ValueError("examples_per_bucket must be nonnegative")
+        self.rng = random.Random(seed)
+        self.examples_per_bucket = examples_per_bucket
+        self.bucket_counts = {
+            bucket: 0 for bucket in (
+                "rank_201_to_1000", "rank_1001_to_5000",
+                "rank_above_5000", "no_lexical_overlap",
+            )
+        }
+        self.examples: dict[str, list[dict[str, object]]] = {
+            bucket: [] for bucket in self.bucket_counts
+        }
+        self.term_counts = {"shared_name": 0, "shared_type": 0, "neither": 0}
+        self.labeled_count = 0
+        self.per_tactic: dict[str, dict[str, int]] = {}
+
+    def record(
+        self,
+        *,
+        rank: int | None,
+        query_tokens: Iterable[str],
+        gold_records: Sequence[LemmaRecord],
+        row_index: int,
+        theorem: str,
+        tactic_name: str,
+        tactic_raw: str,
+        state_text: str,
+        top_names: Sequence[str],
+    ) -> None:
+        if not gold_records:
+            return
+        self.labeled_count += 1
+        tactic = self.per_tactic.setdefault(tactic_name, {"labeled": 0, "missed_at_200": 0})
+        tactic["labeled"] += 1
+        if rank is not None and rank <= 200:
+            return
+        tactic["missed_at_200"] += 1
+        category = text_miss_category(rank, query_tokens, gold_records)
+        bucket = str(category["rank_bucket"])
+        self.bucket_counts[bucket] += 1
+        shared_name = bool(category["shared_name_terms"])
+        shared_type = bool(category["shared_type_terms"])
+        self.term_counts["shared_name"] += int(shared_name)
+        self.term_counts["shared_type"] += int(shared_type)
+        self.term_counts["neither"] += int(not (shared_name or shared_type))
+
+        # Reservoir sample within each rank bucket rather than taking the
+        # earliest examples, which tend to be correlated by source file.
+        if not self.examples_per_bucket:
+            return
+        slot = self.bucket_counts[bucket] - 1
+        if slot >= self.examples_per_bucket:
+            slot = self.rng.randrange(self.bucket_counts[bucket])
+        if slot >= self.examples_per_bucket:
+            return
+        example = {
+            "row_index": row_index,
+            "theorem": theorem,
+            "tactic_name": tactic_name,
+            "tactic_raw": tactic_raw,
+            "state_preview": state_text[:800],
+            "best_gold_bm25_rank": rank,
+            "query_token_count": category["query_token_count"],
+            "shared_name_terms": category["shared_name_terms"],
+            "shared_type_terms": category["shared_type_terms"],
+            "gold": [
+                {"name": record.name, "type": record.statement[:300]}
+                for record in gold_records
+            ],
+            "bm25_top_5": list(top_names[:5]),
+        }
+        if slot == len(self.examples[bucket]):
+            self.examples[bucket].append(example)
+        else:
+            self.examples[bucket][slot] = example
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "labeled_query_count": self.labeled_count,
+            "miss_at_200_count": sum(self.bucket_counts.values()),
+            "rank_buckets": self.bucket_counts,
+            "miss_shared_term_counts": self.term_counts,
+            "per_tactic": self.per_tactic,
+            "examples_by_bucket": self.examples,
+        }

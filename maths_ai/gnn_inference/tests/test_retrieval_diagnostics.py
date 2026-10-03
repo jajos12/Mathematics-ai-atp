@@ -12,12 +12,14 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
 from maths_ai.gnn_inference.atp_lean_gnn.premise_retrieval import retrieval_metrics
 from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     PremiseBM25,
+    TextMissAnalysis,
     hit_overlap,
     hybrid_top_k,
     lexical_tokens,
     load_cached_state_text,
     reciprocal_rank_fusion,
     text_graph_hit_overlap,
+    text_miss_category,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import load_pointer_config
 from maths_ai.gnn_inference.scripts.diagnose_retriever import (
@@ -170,3 +172,46 @@ def test_text_graph_overlap_names_which_query_hit() -> None:
         [[1], [8], [9], [7]],
         [[1], [2], [9], [6]],
     ) == {"both": 1, "text_only": 1, "graph_only": 1, "neither": 1}
+
+
+def test_text_failure_categories_preserve_multi_positive_term_overlap() -> None:
+    records = [
+        LemmaRecord(1, "Set.union", "Nat.lt x y", "", ""),
+        LemmaRecord(2, "Nat.add_comm", "List.append a b", "", ""),
+    ]
+    category = text_miss_category(201, {"nat", "append"}, records)
+    assert category == {
+        "rank_bucket": "rank_201_to_1000",
+        "query_token_count": 2,
+        "shared_name_terms": ["nat"],
+        "shared_type_terms": ["append", "nat"],
+    }
+    assert text_miss_category(None, {"unrelated"}, records)["rank_bucket"] == "no_lexical_overlap"
+    with pytest.raises(ValueError, match="miss at K=200"):
+        text_miss_category(200, {"nat"}, records)
+
+
+def test_text_failure_analysis_counts_labeled_rows_and_samples_by_bucket() -> None:
+    record = LemmaRecord(1, "Nat.add_comm", "Nat.add x y", "Nat", "Mathlib")
+    analysis = TextMissAnalysis(seed=42, examples_per_bucket=1)
+    for row, rank in enumerate((1, 201, 1000, 1001, 5000, 5001, None, None)):
+        analysis.record(
+            rank=rank, query_tokens={"nat"} if rank is not None else {"unrelated"},
+            gold_records=[record], row_index=row, theorem=f"Nat.test{row}",
+            tactic_name="rw", tactic_raw="rw [Nat.add_comm]",
+            state_text="⊢ Nat.add x y", top_names=["Nat.succ_eq_add_one"],
+        )
+    report = analysis.as_dict()
+    assert report["labeled_query_count"] == 8
+    assert report["miss_at_200_count"] == 7
+    assert report["rank_buckets"] == {
+        "rank_201_to_1000": 2,
+        "rank_1001_to_5000": 2,
+        "rank_above_5000": 1,
+        "no_lexical_overlap": 2,
+    }
+    assert report["miss_shared_term_counts"] == {
+        "shared_name": 5, "shared_type": 5, "neither": 2,
+    }
+    assert report["per_tactic"]["rw"] == {"labeled": 8, "missed_at_200": 7}
+    assert all(len(examples) == 1 for examples in report["examples_by_bucket"].values())

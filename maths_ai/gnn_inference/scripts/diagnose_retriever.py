@@ -37,6 +37,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.retrieval_diagnostics import (
     PremiseBM25,
+    TextMissAnalysis,
     hit_overlap,
     hybrid_top_k,
     lexical_tokens,
@@ -70,6 +71,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-name", default=DATASET_NAME,
         help="Upstream benchmark to stream when --text-source upstream is selected",
+    )
+    parser.add_argument(
+        "--text-failure-examples-per-bucket", type=int, default=8,
+        help="Representative missed proof steps for each text-BM25 gold-rank bucket",
     )
     return parser
 
@@ -137,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--max-queries must be positive")
     if args.graph_samples < 1 or args.failure_examples < 0:
         raise ValueError("--graph-samples must be positive and --failure-examples nonnegative")
+    if args.text_failure_examples_per_bucket < 0:
+        raise ValueError("--text-failure-examples-per-bucket must be nonnegative")
     device = resolve_device(args.device)
     config = load_pointer_config(args.config, device_override=args.device)
     config = _diagnostic_config(config, args.prepared_root)
@@ -181,6 +188,9 @@ def main(argv: list[str] | None = None) -> int:
     bm25_gold_ranks: list[int | None] = []
     text_rows: list[list[int]] = []
     text_gold_ranks: list[int | None] = []
+    text_analysis = TextMissAnalysis(
+        seed=args.seed, examples_per_bucket=args.text_failure_examples_per_bucket
+    )
     text_without_tokens = 0
     positive_rows: list[list[int]] = []
     failures: list[dict[str, object]] = []
@@ -220,6 +230,17 @@ def main(argv: list[str] | None = None) -> int:
                 text_rows.append(text_ids)
                 if gold_ids:
                     text_gold_ranks.append(text_rank)
+                    text_analysis.record(
+                        rank=text_rank,
+                        query_tokens=text_tokens,
+                        gold_records=[by_id[lemma_id] for lemma_id in gold_ids],
+                        row_index=source_row_index,
+                        theorem=str(batch.theorem[row]),
+                        tactic_name=str(batch.tactic_name[row]),
+                        tactic_raw=str(batch.tactic_raw[row]),
+                        state_text=text_states[source_row_index],
+                        top_names=[by_id[lemma_id].name for lemma_id in text_ids[:5]],
+                    )
             gnn_rows.append(gnn_ids)
             lexical_rows.append(bm25_ids)
             if gold_ids:
@@ -334,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             "text_vs_graph_bm25_top_200_hit_overlap": text_graph_hit_overlap(
                 text_rows, lexical_rows, positive_rows
             ),
+            "text_bm25_failure_analysis": text_analysis.as_dict(),
         } if args.text_source != "none" else {}),
         "hybrid_150_bm25_50_gnn": retrieval_metrics(hybrid_150_50, positive_rows).as_dict(),
         "hybrid_180_bm25_20_gnn": retrieval_metrics(hybrid_180_20, positive_rows).as_dict(),
@@ -364,6 +386,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Results saved to {output}\n" + json.dumps({
         key: report[key] for key in summary_keys
     }, indent=2), flush=True)
+    if args.text_source != "none":
+        analysis = text_analysis.as_dict()
+        print("Text-BM25 failure summary: " + json.dumps({
+            "labeled_query_count": analysis["labeled_query_count"],
+            "miss_at_200_count": analysis["miss_at_200_count"],
+            "rank_buckets": analysis["rank_buckets"],
+            "miss_shared_term_counts": analysis["miss_shared_term_counts"],
+        }, indent=2), flush=True)
     return 0
 
 

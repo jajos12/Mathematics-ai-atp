@@ -123,6 +123,13 @@ def _load_text_states(args, val_dataset) -> dict[int, str]:
     return states
 
 
+def _original_row_index(batch, row: int) -> int:
+    """Undo PyG's automatic node offset for attributes named '*index'."""
+    # PyG treats `row_index` like a node index, adding the cumulative number
+    # of preceding nodes. Prepared source row IDs are not graph node indices.
+    return int(batch.row_index[row]) - int(batch.ptr[row])
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.max_queries is not None and args.max_queries < 1:
@@ -188,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         for row, (gnn_ids, gold_ids) in enumerate(zip(ranked, positives)):
             if args.max_queries is not None and row_count >= args.max_queries:
                 break
+            source_row_index = _original_row_index(batch, row)
             node_ids = batch.x[batch.ptr[row]:batch.ptr[row + 1]].tolist()
             unknown_count = node_ids.count(unknown_id)
             state_nodes += len(node_ids)
@@ -203,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                 tokens, gold_ids, k=200
             )
             if args.text_source != "none":
-                text_tokens = set(lexical_tokens(text_states[int(batch.row_index[row])]))
+                text_tokens = set(lexical_tokens(text_states[source_row_index]))
                 text_without_tokens += int(not text_tokens)
                 text_ids, text_rank = lexical.search_with_gold_rank(
                     text_tokens, gold_ids, k=200
@@ -229,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                 if slot >= args.failure_examples:
                     continue
                 example = {
-                    "row_index": int(batch.row_index[row]),
+                    "row_index": source_row_index,
                     "theorem": str(batch.theorem[row]),
                     "tactic": str(batch.tactic_raw[row]),
                     "query_tokens": sorted(tokens)[:80],

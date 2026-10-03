@@ -1,7 +1,7 @@
 """Verify lexical retrieval against known token and ranking expectations."""
 
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 from pathlib import Path
 import json
 from types import SimpleNamespace
@@ -23,6 +23,7 @@ from maths_ai.gnn_inference.scripts.diagnose_retriever import (
     _diagnostic_config,
     _load_text_states,
     _oov_stats,
+    _original_row_index,
 )
 
 
@@ -151,3 +152,12 @@ def test_upstream_text_join_checks_row_identity(monkeypatch) -> None:
     row.tactic = "exact Nat.add_comm"
     with pytest.raises(ValueError, match="does not match prepared graph"):
         _load_text_states(args, [data])
+
+
+def test_original_row_index_undoes_pyg_node_offsets() -> None:
+    graphs = [Data(x=torch.zeros(size, dtype=torch.long)) for size in (3, 5, 7)]
+    for graph, original in zip(graphs, (33, 34, 150)):
+        graph.row_index = original
+    batch = Batch.from_data_list(graphs)
+    assert batch.row_index.tolist() == [33, 37, 158]
+    assert [_original_row_index(batch, row) for row in range(3)] == [33, 34, 150]

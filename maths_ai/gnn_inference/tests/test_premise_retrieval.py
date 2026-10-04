@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,6 +28,11 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_retriever_training import (
     sample_accessible_unused_ids,
     train_retriever_epoch,
 )
+from maths_ai.gnn_inference.atp_lean_gnn.retriever_experiments import (
+    encode_corpus_index, evaluate_index,
+)
+from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
+from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 
 
 class _ToyEncoder(nn.Module):
@@ -81,6 +87,164 @@ class _TrainingBatch(SimpleNamespace):
 class _FailingLemmaStore:
     def batch(self, lemma_ids, *, device):
         raise AssertionError("frozen lemma graphs must not be re-encoded")
+
+
+class _ToyLemmaStore:
+    def batch(self, lemma_ids, *, device):
+        return SimpleNamespace(
+            features=torch.eye(4, device=device)[
+                torch.tensor([int(lemma_id) % 4 for lemma_id in lemma_ids], device=device)
+            ]
+        )
+
+
+def test_trainable_lemma_tower_receives_gradients() -> None:
+    model = DualEncoderRetriever(_ToyEncoder(4), _ToyEncoder(4), hidden_dim=4)
+    batch = _TrainingBatch(
+        features=torch.eye(4)[:2], y=torch.tensor([1, 1]),
+        arg_count=torch.tensor([1, 1]),
+        arg_lemma_ids=torch.tensor([10, 11]),
+        arg_node_indices=torch.tensor([-1, -1]),
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    train_retriever_epoch(
+        model, [batch], _ToyLemmaStore(), _NormalizedPriorIndex(),
+        optimizer=optimizer, device=torch.device("cpu"),
+        accessible_negative_count=1, hard_negative_count=0,
+        grad_clip=1.0, rng=random.Random(42),
+        trainable_lemma_tower=True, max_batches=1,
+    )
+    assert model.lemma_encoder.projection.weight.grad is not None
+    assert model.lemma_projection.weight.grad is not None
+
+
+def test_interrupted_graph_epoch_resumes_without_replaying_batches() -> None:
+    torch.manual_seed(3)
+    initial = DualEncoderRetriever(_ToyEncoder(4), _ToyEncoder(4), hidden_dim=4)
+
+    def batches():
+        return [
+            _TrainingBatch(
+                features=torch.eye(4)[i:i + 1], y=torch.tensor([1]),
+                arg_count=torch.tensor([1]),
+                arg_lemma_ids=torch.tensor([10 + i]),
+                arg_node_indices=torch.tensor([-1]),
+            ) for i in range(2)
+        ]
+
+    def train(model, optimizer, rng, *, max_batches, start_batch=0, progress=None):
+        return train_retriever_epoch(
+            model, batches(), _ToyLemmaStore(), _NormalizedPriorIndex(),
+            optimizer=optimizer, device=torch.device("cpu"),
+            accessible_negative_count=1, hard_negative_count=0,
+            grad_clip=1.0, rng=rng, trainable_lemma_tower=True,
+            max_batches=max_batches, start_batch=start_batch,
+            progress=progress, progress_every=1,
+        )
+
+    full = copy.deepcopy(initial)
+    full_optimizer = torch.optim.AdamW(full.parameters(), lr=1e-3)
+    train(full, full_optimizer, random.Random(42), max_batches=2)
+
+    paused = copy.deepcopy(initial)
+    paused_optimizer = torch.optim.AdamW(paused.parameters(), lr=1e-3)
+    progress = []
+    train(
+        paused, paused_optimizer, random.Random(42), max_batches=1,
+        progress=lambda next_batch, rng: progress.append((next_batch, rng.getstate())),
+    )
+    resumed = copy.deepcopy(initial)
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
+    resumed.load_state_dict(paused.state_dict())
+    resumed_optimizer.load_state_dict(paused_optimizer.state_dict())
+    rng = random.Random(42)
+    rng.setstate(progress[0][1])
+    assert progress[0][0] == 1
+    train(resumed, resumed_optimizer, rng, max_batches=2, start_batch=1)
+    for key, tensor in full.state_dict().items():
+        assert torch.allclose(tensor, resumed.state_dict()[key], atol=1e-6)
+
+
+def test_rebuilt_corpus_index_reflects_updated_lemma_vectors(tmp_path) -> None:
+    records = [
+        LemmaRecord(10, "A", "A : Prop", "", ""),
+        LemmaRecord(11, "B", "B : Prop", "", ""),
+    ]
+    columns = [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0])]
+    def encode(ids):
+        return torch.stack([columns[0 if lemma_id == 10 else 1] for lemma_id in ids])
+    first = encode_corpus_index(
+        records, encode, batch_size=1,
+        manifest={"model_type": "joint_graph_retriever_index_v1", "normalize": True},
+        output_dir=tmp_path / "epoch_1",
+    )
+    assert first.search(torch.tensor([[1.0, 0.0]]), k=1)[0] == [[10]]
+    columns.reverse()
+    second = encode_corpus_index(
+        records, encode, batch_size=1,
+        manifest={"model_type": "joint_graph_retriever_index_v1", "normalize": True},
+        output_dir=tmp_path / "epoch_2",
+    )
+    assert second.search(torch.tensor([[1.0, 0.0]]), k=1)[0] == [[11]]
+    assert LemmaIndex.load(tmp_path / "epoch_2").lemma_ids == [10, 11]
+
+
+def test_full_corpus_encoding_resumes_without_reencoding_finished_batches(tmp_path) -> None:
+    records = [LemmaRecord(i, str(i), "x : Nat", "", "") for i in (10, 11, 12)]
+    calls = []
+
+    def interrupted(ids):
+        calls.extend(ids)
+        if 12 in ids:
+            raise RuntimeError("session restarted")
+        return torch.eye(3)[torch.tensor([i - 10 for i in ids])]
+
+    path = tmp_path / "unfinished"
+    with pytest.raises(RuntimeError, match="session restarted"):
+        encode_corpus_index(
+            records, interrupted, batch_size=1,
+            manifest={"encoder_state_sha256": "original"}, output_dir=path,
+        )
+    assert calls == [10, 11, 12]
+    assert not (path / "manifest.json").exists()
+    with pytest.raises(ValueError, match="different lemma tower"):
+        encode_corpus_index(
+            records, interrupted, batch_size=1,
+            manifest={"encoder_state_sha256": "wrong"}, output_dir=path,
+        )
+    def resumed(ids):
+        calls.extend(ids)
+        return torch.eye(3)[torch.tensor([i - 10 for i in ids])]
+
+    result = encode_corpus_index(
+        records, resumed, batch_size=1,
+        manifest={"encoder_state_sha256": "original"}, output_dir=path,
+    )
+    assert calls == [10, 11, 12, 12]
+    assert result.search(torch.tensor([[0.0, 0.0, 1.0]]), k=1)[0] == [[12]]
+    assert (path / "manifest.json").exists()
+    assert not (path / "progress.json").exists()
+
+
+def test_experiment_evaluation_uses_same_labeled_step_denominator() -> None:
+    records = [LemmaRecord(i, str(i), "x : Nat", "", "") for i in (10, 11, 12)]
+    index = encode_corpus_index(
+        records,
+        lambda ids: torch.eye(3)[torch.tensor([i - 10 for i in ids])],
+        batch_size=2, manifest={"normalize": True},
+    )
+    batches = [
+        (torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), [[10], [12]]),
+        (torch.tensor([[0.0, 0.0, 1.0]]), [[]]),
+    ]
+    metrics = evaluate_index(
+        index, batches, encode_queries=lambda batch: batch[0],
+        extract_positives=lambda batch: batch[1], ks=(1, 2),
+    )
+    assert metrics["query_count"] == 3
+    assert metrics["labeled_query_count"] == 2
+    assert metrics["label_coverage"] == pytest.approx(2 / 3)
+    assert metrics["recall_at_1"] == 0.5
 
 
 def test_dual_encoder_uses_separate_towers_and_normalizes() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -303,6 +303,11 @@ def train_retriever_epoch(
     grad_clip: float,
     rng: random.Random,
     hard_negative_index=None,
+    trainable_lemma_tower: bool = False,
+    max_batches: int | None = None,
+    start_batch: int = 0,
+    progress: Callable[[int, random.Random], None] | None = None,
+    progress_every: int = 100,
 ) -> dict[str, int | float]:
     """Train state queries against encoded positives and three negative sources."""
     if not frozen_index.normalize_queries:
@@ -323,7 +328,15 @@ def train_retriever_epoch(
     # during index construction and then abort a batch for an unusable negative.
     all_accessible = tuple(int(value) for value in frozen_index.lemma_ids)
 
-    for batch in loader:
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be positive")
+    if start_batch < 0 or progress_every < 1:
+        raise ValueError("start_batch must be nonnegative and progress_every positive")
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        if batch_index < start_batch:
+            continue
         batch = batch.to(device)
         positive_rows = extract_external_positive_ids(
             batch, name_to_id=getattr(frozen_index, "name_to_id", None)
@@ -351,7 +364,12 @@ def train_retriever_epoch(
             query_count += len(positive_rows)
             continue
 
-        if hasattr(frozen_index, "id_to_position") and hasattr(
+        if trainable_lemma_tower:
+            if lemma_store is None:
+                raise ValueError("trainable lemma tower requires a lemma graph store")
+            lemma_batch = lemma_store.batch(candidates.lemma_ids, device=device)
+            lemma_embeddings = model.encode_lemmas(lemma_batch)
+        elif hasattr(frozen_index, "id_to_position") and hasattr(
             frozen_index, "lemma_vectors"
         ):
             # Index vectors are exact outputs of the frozen lemma tower. Re-running
@@ -388,6 +406,8 @@ def train_retriever_epoch(
         in_batch_count += candidates.in_batch_negative_count
         accessible_count += candidates.accessible_negative_count
         hard_count += candidates.hard_negative_count
+        if progress is not None and (batch_index + 1) % progress_every == 0:
+            progress(batch_index + 1, rng)
 
     return {
         "loss": loss_sum / max(labeled_query_count, 1),

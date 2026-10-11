@@ -169,6 +169,7 @@ def build_unified_pools(
     lemma_index: LemmaIndexLike | None = None,
     k: int = 500,
     retrieval_state_vecs: Tensor | None = None,
+    library_candidates: tuple[list[list[int]], object, object] | None = None,
 ) -> list[CandidatePool]:
     """Return per-graph candidate pools combining local and library premises."""
     if state_vecs.dim() != 2:
@@ -180,7 +181,20 @@ def build_unified_pools(
     batch_size = int(state_vecs.size(0))
 
     # Library search (optional)
-    if lemma_index is not None:
+    if library_candidates is not None:
+        lemma_ids_batch, lemma_vecs_batch, _scores = library_candidates
+        if len(lemma_ids_batch) != batch_size:
+            raise ValueError("cached library candidates must have one row per graph")
+        lemma_vecs_batch = torch.from_numpy(lemma_vecs_batch).to(
+            device=device, dtype=node_embeddings.dtype
+        )
+        if lemma_vecs_batch.ndim != 3 or lemma_vecs_batch.size(2) != node_embeddings.size(1):
+            raise ValueError("cached library vectors do not match pointer embedding dimension")
+        if lemma_vecs_batch.size(0) != batch_size or any(
+            len(ids) != lemma_vecs_batch.size(1) for ids in lemma_ids_batch
+        ):
+            raise ValueError("cached library ID and vector counts differ")
+    elif lemma_index is not None:
         search_vecs = state_vecs if retrieval_state_vecs is None else retrieval_state_vecs
         if search_vecs.size(0) != batch_size:
             raise ValueError("retrieval_state_vecs returned a batch size mismatch.")
@@ -216,7 +230,7 @@ def build_unified_pools(
             )
         retrieval_scores = (
             [float(_scores[b, position]) for position in valid_lemma_positions]
-            if lemma_index is not None
+            if lemma_index is not None or library_candidates is not None
             else []
         )
 

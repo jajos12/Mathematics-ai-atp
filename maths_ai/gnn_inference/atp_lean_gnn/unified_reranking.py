@@ -50,6 +50,7 @@ def verify_unified_reranker_dependencies(
     *,
     index_manifest: dict[str, object],
     retriever,
+    candidate_provider=None,
 ) -> None:
     """Refuse index or retriever substitutions that change the trained pool."""
     if checkpoint is None:
@@ -68,6 +69,15 @@ def verify_unified_reranker_dependencies(
     )
     if any(saved_manifest.get(key) != index_manifest.get(key) for key in binding_fields):
         raise ValueError("unified reranker was trained against a different lemma index")
+
+    expected_candidates = checkpoint.get("candidate_manifest")
+    if expected_candidates is not None:
+        if candidate_provider is None:
+            raise ValueError("unified reranker requires its frozen text candidate policy")
+        if expected_candidates != candidate_provider.manifest:
+            raise ValueError("unified reranker was trained with a different candidate policy")
+    elif candidate_provider is not None:
+        raise ValueError("unified reranker was trained without cached text candidates")
 
     expected_retriever_sha = checkpoint.get("retriever_state_sha256")
     if expected_retriever_sha is None:

@@ -7,6 +7,7 @@ premise ranking loss from the unified candidate pool.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -152,6 +153,7 @@ def train_one_epoch_with_premises(
     lemma_index: LemmaIndex,
     *,
     retriever=None,
+    candidate_provider=None,
     optimizer: AdamW,
     grad_scaler,
     device: torch.device,
@@ -166,6 +168,9 @@ def train_one_epoch_with_premises(
     use_amp: bool,
     amp_dtype: torch.dtype | None = None,
     pin_memory: bool = False,
+    start_batch: int = 0,
+    checkpoint_callback: Callable[[int], None] | None = None,
+    checkpoint_every: int = 50,
 ) -> dict[str, float | int]:
     """Train one epoch with combined tactic + argument + premise ranking loss."""
     model.train()
@@ -173,6 +178,10 @@ def train_one_epoch_with_premises(
     scorer.train()
     if retriever is not None:
         retriever.eval()
+    if candidate_provider is not None and retriever is not None:
+        raise ValueError("choose cached candidates or graph retriever, not both")
+    if start_batch < 0 or checkpoint_every < 1:
+        raise ValueError("invalid resume batch or checkpoint interval")
 
     total_tactic_loss = 0.0
     total_arg_loss = 0.0
@@ -192,6 +201,8 @@ def train_one_epoch_with_premises(
     )
 
     for batch_index, batch in enumerate(loader, start=1):
+        if batch_index <= start_batch:
+            continue
         batch = batch.to(
             device, non_blocking=(device.type == "cuda" and pin_memory)
         )
@@ -256,6 +267,10 @@ def train_one_epoch_with_premises(
                 lemma_index=lemma_index,
                 k=k,
                 retrieval_state_vecs=retrieval_state_emb,
+                library_candidates=(
+                    candidate_provider.search(batch, k=k)
+                    if candidate_provider is not None else None
+                ),
             )
             pools = ensure_library_targets(pools, lemma_index, arg_lemma_targets)
 
@@ -307,6 +322,8 @@ def train_one_epoch_with_premises(
             float(p_metrics["candidate_source_accuracy"])
             * int(p_metrics["scored_target_count"])
         )
+        if checkpoint_callback is not None and batch_index % checkpoint_every == 0:
+            checkpoint_callback(batch_index)
 
         if _should_log_batch(
             batch_index, total_batches, log_every_batches=log_every_batches
@@ -347,6 +364,7 @@ def evaluate_model_with_premises(
     lemma_index: LemmaIndex,
     *,
     retriever=None,
+    candidate_provider=None,
     device: torch.device,
     unknown_tactic_id: int,
     arg_loss_weight: float,
@@ -364,6 +382,8 @@ def evaluate_model_with_premises(
     scorer.eval()
     if retriever is not None:
         retriever.eval()
+    if candidate_provider is not None and retriever is not None:
+        raise ValueError("choose cached candidates or graph retriever, not both")
 
     total_tactic_loss = 0.0
     total_arg_loss = 0.0
@@ -440,6 +460,10 @@ def evaluate_model_with_premises(
                 lemma_index=lemma_index,
                 k=k,
                 retrieval_state_vecs=retrieval_state_emb,
+                library_candidates=(
+                    candidate_provider.search(batch, k=k)
+                    if candidate_provider is not None else None
+                ),
             )
             target_positions, target_metrics = resolve_ordered_pool_targets(
                 pools,

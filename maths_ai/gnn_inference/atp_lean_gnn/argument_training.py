@@ -142,7 +142,8 @@ def train_one_epoch_with_args(
                 unknown_tactic_id=unknown_tactic_id,
                 # Diagnosis fields
                 node_labels=batch.x,
-                node_types=batch.node_type
+                node_types=batch.node_type,
+                argument_supervision_mask=getattr(batch, "action_target_supported", None),
             )
 
         if not torch.isfinite(loss):
@@ -151,6 +152,10 @@ def train_one_epoch_with_args(
                 f"tactic_loss={metrics['tactic_loss']:.4f}, "
                 f"arg_loss={metrics['arg_loss']:.4f}."
             )
+        if not loss.requires_grad:
+            # An all-unsupported batch with no trainable tactic signal must not
+            # fabricate argument/stop gradients merely to make backward valid.
+            continue
         grad_scaler.scale(loss).backward()
         grad_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -247,6 +252,7 @@ def evaluate_model_with_args(
                 stop_logits_list=stop_logits_list,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
+                argument_supervision_mask=getattr(batch, "action_target_supported", None),
             )
             _, oracle_arg_logits, oracle_stop_logits = model(
                 batch,
@@ -263,6 +269,7 @@ def evaluate_model_with_args(
                 stop_logits_list=oracle_stop_logits,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
+                argument_supervision_mask=getattr(batch, "action_target_supported", None),
             )
 
         bs = int(targets.numel())

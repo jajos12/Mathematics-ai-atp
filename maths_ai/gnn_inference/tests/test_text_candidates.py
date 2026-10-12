@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -263,13 +264,20 @@ def test_candidate_preparation_cli_resumes_mid_split(tmp_path, monkeypatch):
     monkeypatch.setattr(script, "load_frozen_text_retriever", lambda *a, **k: (model, None, index, saved))
     monkeypatch.setattr(script, "load_index_for_encoder", lambda *a, **k: index)
     monkeypatch.setattr(script, "load_pointer_config", lambda *a: SimpleNamespace(edge_mode="bidirectional"))
-    monkeypatch.setattr(script, "load_prepared_metadata", lambda *a: SimpleNamespace(node_vocab={}, tactic_vocab={}))
+    monkeypatch.setattr(script, "load_prepared_metadata", lambda path: SimpleNamespace(
+        root=Path(path), node_vocab={}, tactic_vocab={},
+    ))
 
     class Prepared(list):
         def __init__(self, metadata, *, split, **kwargs):
             super().__init__([_graph(7), _graph(9)])
             for data in self:
                 data.split = split
+                if metadata.root.name == "repaired":
+                    data.arg_label_policy = "flat_reference_v2"
+                    data.action_target_supported = True
+                    data.citation_lemma_ids = torch.tensor([101])
+                    data.citation_count = 1
 
     monkeypatch.setattr(script, "PreparedGraphDataset", Prepared)
     monkeypatch.setattr(script, "iter_dataset_rows", lambda *, dataset_name, split: iter([
@@ -304,3 +312,54 @@ def test_candidate_preparation_cli_resumes_mid_split(tmp_path, monkeypatch):
     provider = CachedTextCandidates(output, index)
     assert provider.manifest["splits"]["val"]["retrieval_metrics"]["labeled_query_count"] == 2
     assert provider.search(Batch.from_data_list([_graph(9)]), k=200)[1].shape == (1, 200, 8)
+    repaired = tmp_path / "repaired"
+    repaired.mkdir()
+    (repaired / "argument_labels.json").write_text(json.dumps({"source_root": str(tmp_path)}))
+    reused_argv = argv.copy()
+    reused_argv[reused_argv.index("--prepared-root") + 1] = str(repaired)
+    reused_argv[reused_argv.index("--output-dir") + 1] = str(tmp_path / "rebound")
+    script.main([*reused_argv, "--reuse-candidate-dir", str(output)])
+    assert len(calls) == 5  # ranks are reused, with no model query encoding
+    rebound = CachedTextCandidates(tmp_path / "rebound", index)
+    rebound.validate_dataset(Prepared(SimpleNamespace(root=repaired), split="val"), split="val")
+    np.testing.assert_array_equal(rebound.tables["val"]["ids"], provider.tables["val"]["ids"])
+
+
+def test_unsupported_rows_are_skipped_in_training_and_counted_as_validation_misses(tmp_path):
+    provider, pointer, graphs = _provider(tmp_path)
+    for row, data in enumerate(graphs):
+        data.action_target_supported = row == 1
+        data.arg_count = 0
+        data.arg_node_indices = torch.empty(0, dtype=torch.long)
+        data.arg_lemma_ids = torch.empty(0, dtype=torch.long)
+    model = TacticWithArgsClassifier(
+        num_node_labels=4, num_tactics=4, hidden_dim=8, num_layers=1, max_args=2,
+    )
+    model.backbone.requires_grad_(False)
+    scorer = PremiseScorer(8)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad])
+    trained = train_one_epoch_with_premises(
+        model, scorer, DataLoader(graphs, batch_size=2), pointer, candidate_provider=provider,
+        optimizer=optimizer, grad_scaler=torch.amp.GradScaler("cpu", enabled=False),
+        device=torch.device("cpu"), grad_clip=1.0, unknown_tactic_id=0,
+        arg_loss_weight=0.5, premise_loss_weight=1.0, k=1,
+        epoch=1, total_epochs=1, log_every_batches=1, use_amp=False,
+    )
+    assert trained["example_count"] == 1
+    assert trained["unsupported_example_count"] == 1
+    with torch.no_grad():
+        model.stop_head.weight.zero_()
+        model.stop_head.bias.fill_(20)
+        model.backbone.classifier.weight.zero_()
+        model.backbone.classifier.bias.fill_(-20)
+        model.backbone.classifier.bias[1] = 20
+    metrics = evaluate_model_with_premises(
+        model, scorer, DataLoader(graphs, batch_size=2), pointer, candidate_provider=provider,
+        device=torch.device("cpu"), unknown_tactic_id=0,
+        arg_loss_weight=0.5, premise_loss_weight=1.0, k=1,
+        tactic_vocab={"<UNK>": 0, "exact": 1, "apply": 2, "rw": 3},
+    )
+    assert metrics["evaluated_count"] == 2
+    assert metrics["complete_action_exact_match_predicted_tactic"] == 0.5
+    assert metrics["supported_action_exact_match_predicted_tactic"] == 1.0
+    assert metrics["action_target_unsupported_count"] == 1

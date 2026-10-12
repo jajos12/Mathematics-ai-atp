@@ -50,6 +50,9 @@ def main(argv=None):
     ).normalized()
     device = resolve_device(args.device)
     metadata = load_prepared_metadata(args.prepared_root)
+    label_binding = args.prepared_root / "argument_labels.json"
+    if label_binding.exists() and json.loads(label_binding.read_text())["max_args"] != config.max_args:
+        raise ValueError("relabeling budget differs from scorer decoder capacity")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state = checkpoint.get("model_state_dict", checkpoint)
     if any(str(key).startswith("module.") for key in state):
@@ -69,6 +72,10 @@ def main(argv=None):
     )
     for split in ("train", "val"):
         provider.validate_dataset(datasets[split], split=split)
+    supported_train = sum(bool(getattr(data, "action_target_supported", True)) for data in datasets["train"])
+    if not supported_train:
+        raise ValueError("prepared train split contains no supported flat-action targets")
+    print(f"Supported training actions: {supported_train}/{len(datasets['train'])}", flush=True)
     model.backbone.requires_grad_(False)
     model = model.to(device)
     scorer = PremiseScorer(config.model.hidden_dim).to(device)

@@ -93,6 +93,11 @@ def matched_text_rows(
             arg_node_indices=data.arg_node_indices,
             tactic_raw=data.tactic_raw,
         )
+        if hasattr(data, "arg_label_policy"):
+            example.arg_label_policy = data.arg_label_policy
+        if hasattr(data, "citation_lemma_ids"):
+            example.citation_lemma_ids = data.citation_lemma_ids
+            example.citation_count = torch.tensor([int(data.citation_count)])
         positives = extract_external_positive_ids(example, name_to_id=name_to_id)[0]
         result[row.row_index] = goal_first_text(row.state), positives
         if len(result) == len(examples):

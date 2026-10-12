@@ -14,7 +14,7 @@ from torch.optim import Optimizer
 from torch_geometric.data import Batch
 
 from .graph import lemma_statement_to_dag, root_state_node_id
-from .labels import parse_tactic_arguments
+from .labels import stored_tactic_arguments
 from .lemma_corpus import LemmaRecord, load_lemma_corpus
 from .premise_retrieval import (
     DualEncoderRetriever,
@@ -135,12 +135,22 @@ def extract_external_positive_ids(
         raise ValueError("tactic_raw must contain one value per proof state")
 
     result: list[list[int]] = []
+    if hasattr(batch, "citation_lemma_ids") and hasattr(batch, "citation_count"):
+        citation_counts = [int(value) for value in batch.citation_count.view(-1).tolist()]
+        citation_ids = [int(value) for value in batch.citation_lemma_ids.view(-1).tolist()]
+        if len(citation_counts) != batch_size or sum(citation_counts) != len(citation_ids):
+            raise ValueError("citation_count does not align with citation_lemma_ids")
+        offset = 0
+        for count in citation_counts:
+            result.append(list(dict.fromkeys(value for value in citation_ids[offset:offset + count] if value >= 0)))
+            offset += count
+        return result
     offset = 0
     for row_index, count in enumerate(counts):
         row = flat_ids[offset : offset + count]
         local_row = flat_local_ids[offset : offset + count]
         if name_to_id and raw_tactics:
-            _, argument_names = parse_tactic_arguments(str(raw_tactics[row_index]))
+            _, argument_names = stored_tactic_arguments(batch, row_index, str(raw_tactics[row_index]))
             row = list(row)
             for position, argument_name in enumerate(argument_names[:count]):
                 if row[position] < 0 and local_row[position] < 0:

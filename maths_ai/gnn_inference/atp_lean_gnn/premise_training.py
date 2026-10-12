@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import AdamW
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier, compute_combined_loss
-from .labels import parse_tactic_arguments
+from .labels import stored_tactic_arguments
 from .graph import BINDER_KIND_FORALL
 from .lemma_index import LemmaIndex
 from .premise_pool import (
@@ -139,11 +140,21 @@ def _recover_lemma_targets(
         raw_tactics = [raw_tactics]
     recovered = lemma_targets.clone()
     for row, raw_tactic in enumerate(raw_tactics):
-        _, arguments = parse_tactic_arguments(str(raw_tactic))
+        _, arguments = stored_tactic_arguments(batch, row, str(raw_tactic))
         for column, argument in enumerate(arguments[: recovered.size(1)]):
             if local_targets[row, column] < 0 and recovered[row, column] < 0:
                 recovered[row, column] = int(name_to_id.get(argument, -1))
     return recovered
+
+
+def _action_supported(batch) -> torch.Tensor:
+    flags = getattr(batch, "action_target_supported", None)
+    if flags is None:
+        return torch.ones(int(batch.y.numel()), dtype=torch.bool, device=batch.y.device)
+    supported = torch.as_tensor(flags, dtype=torch.bool, device=batch.y.device).view(-1)
+    if supported.numel() != batch.y.numel():
+        raise ValueError("action support flags must have one entry per graph")
+    return supported
 
 
 def train_one_epoch_with_premises(
@@ -188,6 +199,7 @@ def train_one_epoch_with_premises(
     total_premise_loss = 0.0
     total_combined_loss = 0.0
     total_examples = 0
+    unsupported_examples = 0
     total_reranking_targets = 0
     total_reranking_scored = 0
     total_unresolved_targets = 0
@@ -203,6 +215,16 @@ def train_one_epoch_with_premises(
     for batch_index, batch in enumerate(loader, start=1):
         if batch_index <= start_batch:
             continue
+        supported = _action_supported(batch)
+        unsupported_examples += int((~supported).sum().item())
+        if not supported.any():
+            if checkpoint_callback is not None and batch_index % checkpoint_every == 0:
+                checkpoint_callback(batch_index)
+            continue
+        if not supported.all():
+            batch = Batch.from_data_list([
+                data for data, keep in zip(batch.to_data_list(), supported.tolist()) if keep
+            ])
         batch = batch.to(
             device, non_blocking=(device.type == "cuda" and pin_memory)
         )
@@ -346,6 +368,7 @@ def train_one_epoch_with_premises(
         "premise_loss": total_premise_loss / n,
         "combined_loss": total_combined_loss / n,
         "example_count": total_examples,
+        "unsupported_example_count": unsupported_examples,
         "reranking_target_count": total_reranking_targets,
         "reranking_scored_target_count": total_reranking_scored,
         "reranking_target_coverage": total_reranking_scored
@@ -399,6 +422,7 @@ def evaluate_model_with_premises(
     predicted_ranked_actions = []
     oracle_ranked_actions = []
     action_targets: list[ActionTarget] = []
+    action_supported_flags: list[bool] = []
 
     total_count = 0
     total_batches = len(loader)
@@ -415,6 +439,8 @@ def evaluate_model_with_premises(
             device, non_blocking=(device.type == "cuda" and pin_memory)
         )
         targets = batch.y.view(-1)
+        supported = _action_supported(batch)
+        action_supported_flags.extend(supported.tolist())
         tactic_names = _extract_tactic_names(batch)
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
         pointer_arg_targets = _local_to_global_arg_targets(arg_targets, batch, device)
@@ -438,6 +464,7 @@ def evaluate_model_with_premises(
                 stop_logits_list=stop_logits_list,
                 arg_loss_weight=arg_loss_weight,
                 unknown_tactic_id=unknown_tactic_id,
+                argument_supervision_mask=supported,
             )
 
             with torch.no_grad():
@@ -477,7 +504,8 @@ def evaluate_model_with_premises(
                 state_emb,
                 targets,
                 pools,
-                target_positions,
+                [positions if bool(supported[row]) else None
+                 for row, positions in enumerate(target_positions)],
             )
 
         id_to_tactic = (
@@ -496,7 +524,8 @@ def evaluate_model_with_premises(
         for row, (pool, positions) in enumerate(zip(pools, target_positions)):
             expected_count = min(arg_counts[row], model.max_args)
             resolved = not (
-                arg_counts[row] > model.max_args
+                not bool(supported[row])
+                or arg_counts[row] > model.max_args
                 or len(positions) != expected_count
                 or any(position < 0 for position in positions)
             )
@@ -626,6 +655,9 @@ def evaluate_model_with_premises(
     oracle_action_metrics = complete_action_metrics(
         oracle_ranked_actions, action_targets, ks=(1, 5)
     )
+    supported_actions = [actions for actions, keep in zip(predicted_ranked_actions, action_supported_flags) if keep]
+    supported_targets = [target for target, keep in zip(action_targets, action_supported_flags) if keep]
+    conditional = complete_action_metrics(supported_actions, supported_targets, ks=(1, 5))
     return {
         "tactic_loss": total_tactic_loss / n,
         "arg_loss": total_arg_loss / n,
@@ -665,6 +697,11 @@ def evaluate_model_with_premises(
         ],
         "complete_action_per_tactic": predicted_action_metrics["per_tactic"],
         "complete_action_labeled_count": len(action_targets),
+        "action_target_supported_count": sum(action_supported_flags),
+        "action_target_unsupported_count": len(action_supported_flags) - sum(action_supported_flags),
+        "complete_action_resolved_count": sum(target.resolved for target in action_targets),
+        "supported_action_exact_match_predicted_tactic": conditional["complete_action_exact_match"],
+        "supported_action_recall_at_5_predicted_tactic": conditional["action_recall_at_5"],
         # Compatibility aliases for old dashboards. These now describe the
         # complete-action decoder rather than the retired one-premise scorer.
         "premise_recall": reranking_scored_count / max(reranking_target_count, 1),

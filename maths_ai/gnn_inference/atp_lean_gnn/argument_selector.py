@@ -392,10 +392,21 @@ def compute_combined_loss(
     unknown_tactic_id: int = 0,
     node_labels: Tensor | None = None,
     node_types: Tensor | None = None,
+    argument_supervision_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float | int]]:
     """Tactic classification, sequence argument, and stop-decision loss."""
     device = tactic_logits.device
     batch_size = tactic_logits.size(0)
+    supervision = (
+        torch.ones(batch_size, dtype=torch.bool, device=device)
+        if argument_supervision_mask is None
+        else argument_supervision_mask.to(device=device, dtype=torch.bool).view(-1)
+    )
+    if supervision.numel() != batch_size:
+        raise ValueError("argument supervision mask must have one flag per graph")
+    if not supervision.all():
+        arg_targets = arg_targets.clone()
+        arg_targets[~supervision] = -1
 
     known_mask = tactic_targets != unknown_tactic_id
     if known_mask.any():
@@ -447,6 +458,8 @@ def compute_combined_loss(
     arg_target_count = 0
     arg_lemma_position_count = 0
     for b in range(batch_size):
+        if not supervision[b]:
+            continue
         count = min(arg_count_per_sample[b], decode_budget)
         for step in range(min(count, arg_targets.size(1))):
             if int(arg_targets[b, step].item()) >= 0:
@@ -455,7 +468,7 @@ def compute_combined_loss(
             if int(arg_targets[b, step].item()) >= 0 and step >= decode_budget:
                 arg_lemma_position_count += 1
     exact_sequence_correct = 0
-    sequence_count = batch_size
+    sequence_count = int(supervision.sum().item())
     exact_sequence_flags = [0] * batch_size
     for step_k, arg_logits_k in enumerate(arg_logits_list):
         if step_k >= padded_targets.size(1):
@@ -511,7 +524,8 @@ def compute_combined_loss(
             dtype=torch.float32,
         )
         stop_logits = torch.stack(stop_logits_list, dim=1)
-        stop_loss = F.binary_cross_entropy_with_logits(stop_logits, stop_targets)
+        if supervision.any():
+            stop_loss = F.binary_cross_entropy_with_logits(stop_logits[supervision], stop_targets[supervision])
         # Count only the decision-relevant positions: the boundary step and
         # one step past it.  After the target flips to stop, later positions
         # are trivially "already stopped" and would inflate the accuracy the
@@ -525,6 +539,7 @@ def compute_combined_loss(
         )
         steps = torch.arange(n_stop_steps, device=device).unsqueeze(0)
         scored = steps <= boundary.unsqueeze(1) + 1
+        scored &= supervision.unsqueeze(1)
         stop_correct = int(
             (
                 ((stop_logits >= 0) == stop_targets.bool()) & scored
@@ -533,6 +548,8 @@ def compute_combined_loss(
         stop_count = int(scored.sum().item())
 
         for sample_index, target_count in enumerate(arg_count_per_sample):
+            if not supervision[sample_index]:
+                continue
             predicted_count = len(stop_logits_list)
             for step_index, stop_logit in enumerate(stop_logits_list):
                 if stop_logit[sample_index] >= 0:
@@ -570,10 +587,12 @@ def compute_combined_loss(
         "arg_position_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
         "arg_lemma_position_count": arg_lemma_position_count,
         "arg_truncated_count": sum(
-            max(count - len(arg_logits_list), 0) for count in arg_count_per_sample
+            max(count - len(arg_logits_list), 0)
+            for row, count in enumerate(arg_count_per_sample) if supervision[row]
         ),
         "arg_truncated_examples": sum(
-            count > len(arg_logits_list) for count in arg_count_per_sample
+            count > len(arg_logits_list)
+            for row, count in enumerate(arg_count_per_sample) if supervision[row]
         ),
         "stop_loss": float(stop_loss.item()),
         "stop_accuracy": stop_correct / max(stop_count, 1),

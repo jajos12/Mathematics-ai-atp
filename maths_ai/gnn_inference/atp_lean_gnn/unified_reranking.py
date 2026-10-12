@@ -192,7 +192,7 @@ def compute_unified_reranking_loss(
     state_embeddings: Tensor,
     tactic_ids: Tensor,
     pools: Sequence[CandidatePool],
-    target_positions: Sequence[Sequence[int]],
+    target_positions: Sequence[Sequence[int] | None],
 ) -> tuple[Tensor, dict[str, int | float]]:
     """Teacher-force ordered mixed candidates through the serving GRU pointer."""
     batch_size = int(state_embeddings.size(0))
@@ -207,6 +207,8 @@ def compute_unified_reranking_loss(
     unresolved_count = 0
 
     for row, (pool, raw_targets) in enumerate(zip(pools, target_positions)):
+        if raw_targets is None:
+            continue
         targets = list(raw_targets[: model.max_args])
         decoder_state = model.argument_selector.initial_state(
             state_embeddings[row : row + 1], tactic_embeddings[row : row + 1]

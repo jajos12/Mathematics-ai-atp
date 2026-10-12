@@ -120,9 +120,16 @@ _BRACKET_OPEN = {"[", "⟨", "("}
 _BRACKET_CLOSE = {"]", "⟩", ")"}
 _ARG_SPLIT_RE = re.compile(r"[,\s]+")
 _ARG_TOKEN_RE = re.compile(r"[A-Za-z0-9_.']+")
+_UNICODE_ARG_TOKEN_RE = re.compile(r"[\w'′]+(?:\.[\w'′]+)*", re.UNICODE)
+_CITATION_TAG_RE = re.compile(r"</?a>")
 
 
-def parse_tactic_arguments(raw: str) -> tuple[str, list[str]]:
+def clean_tactic_markup(raw: str) -> str:
+    """Remove LeanDojo citation highlighting without deleting genuine `a` names."""
+    return _CITATION_TAG_RE.sub("", raw)
+
+
+def parse_tactic_arguments(raw: str, *, legacy: bool = False) -> tuple[str, list[str]]:
     """Extract the tactic family name and a list of argument tokens.
 
     Examples
@@ -136,7 +143,10 @@ def parse_tactic_arguments(raw: str) -> tuple[str, list[str]]:
     >>> parse_tactic_arguments("simp")
     ('simp', [])
     """
-    text = raw.strip()
+    # Unversioned cached targets were produced from ASCII tokens including
+    # citation tags. Recovery must retain that ordering until explicit relabeling.
+    text = (raw if legacy else clean_tactic_markup(raw)).strip()
+    argument_re = _ARG_TOKEN_RE if legacy else _UNICODE_ARG_TOKEN_RE
     if not text:
         return EMPTY_TACTIC, []
 
@@ -166,11 +176,19 @@ def parse_tactic_arguments(raw: str) -> tuple[str, list[str]]:
             break
 
     if bracket_content is not None:
-        for token_match in _ARG_TOKEN_RE.finditer(bracket_content):
+        for token_match in argument_re.finditer(bracket_content):
             args.append(token_match.group(0))
     elif remainder:
         # No brackets — split the remainder on whitespace and take identifier tokens
-        for token_match in _ARG_TOKEN_RE.finditer(remainder):
+        for token_match in argument_re.finditer(remainder):
             args.append(token_match.group(0))
 
     return tactic_name, args
+
+
+def stored_tactic_arguments(batch, row: int, raw: str) -> tuple[str, list[str]]:
+    """Interpret recovery tokens with the same policy as stored target arrays."""
+    policy = getattr(batch, "arg_label_policy", None)
+    if isinstance(policy, (tuple, list)):
+        policy = policy[row]
+    return parse_tactic_arguments(raw, legacy=policy is None)

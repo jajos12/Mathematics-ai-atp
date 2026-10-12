@@ -329,6 +329,7 @@ def _load_resumable_artifact(
             or getattr(data, "theorem", None) != row.theorem
             or getattr(data, "tactic_raw", None) != row.tactic
             or getattr(data, "tactic_name", None) != tactic_name
+            or getattr(data, "arg_label_policy", None) != "unicode_citations_v2"
             or not hasattr(data, "x")
             or not hasattr(data, "edge_index")
             or not hasattr(data, "y")
@@ -497,6 +498,7 @@ def process_split(
         data.arg_node_indices = torch.tensor(arg_indices, dtype=torch.long) if arg_indices else torch.tensor([], dtype=torch.long)
         data.arg_lemma_ids = torch.tensor(arg_lemma_ids, dtype=torch.long) if arg_lemma_ids else torch.tensor([], dtype=torch.long)
         data.arg_count = len(arg_indices)
+        data.arg_label_policy = "unicode_citations_v2"
         # --------------------------------------------------------------
 
         write_pyg_artifact(

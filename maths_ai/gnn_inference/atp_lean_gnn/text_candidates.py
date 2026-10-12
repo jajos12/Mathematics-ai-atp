@@ -25,6 +25,17 @@ def source_rows_digest(dataset) -> str:
             str(data.theorem), str(data.tactic_raw), int(data.arg_count),
             data.arg_node_indices.tolist(), data.arg_lemma_ids.tolist(),
         )
+        if hasattr(data, "arg_label_policy"):
+            identity += (
+                str(data.arg_label_policy),
+                bool(getattr(data, "action_target_supported", True)),
+                str(getattr(data, "action_target_reason", "legacy")),
+                int(getattr(data, "action_target_max_args", 0)),
+                str(getattr(data, "argument_trace_sha256", "")),
+                str(getattr(data, "citation_label_policy", "")),
+                int(getattr(data, "citation_count", 0)),
+                getattr(data, "citation_lemma_ids", torch.tensor([])).tolist(),
+            )
         digest.update(json.dumps(identity, separators=(",", ":")).encode())
     return digest.hexdigest()
 

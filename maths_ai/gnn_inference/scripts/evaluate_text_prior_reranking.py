@@ -78,7 +78,7 @@ def _collect(model, dataset, provider, index, device, *, k, max_library_position
     return samples
 
 
-def _metrics(samples, alpha):
+def _metrics(samples, alpha, *, preserve_source=False):
     result = {"library_positions": 0, "local_positions": 0,
               "library_only_top1": 0, "library_only_top5": 0,
               "mixed_library_top1": 0, "mixed_library_top5": 0,
@@ -91,8 +91,13 @@ def _metrics(samples, alpha):
                       for i, (source, score) in enumerate(vectors)]
         scores = blend_library_scores(pointer, references, alpha=alpha)
         source = references[gold].source
-        rank = rank_of(scores, gold)
-        top_source = references[int(np.argmax(scores))].source
+        if preserve_source:
+            top_source = references[int(np.argmax(pointer))].source
+            allowed = [i for i, ref in enumerate(references) if ref.source is top_source]
+            rank = rank_of(scores, gold, eligible=allowed) if gold in allowed else None
+        else:
+            rank = rank_of(scores, gold)
+            top_source = references[int(np.argmax(scores))].source
         if source is CandidateSource.LIBRARY:
             result["library_positions"] += 1
             library = [i for i, ref in enumerate(references) if ref.source is CandidateSource.LIBRARY]
@@ -107,12 +112,12 @@ def _metrics(samples, alpha):
             result["text_only_library_top1"] += int(text_rank == 1)
             result["text_only_library_top5"] += int(text_rank <= 5)
             result["mixed_library_top1"] += int(rank == 1)
-            result["mixed_library_top5"] += int(rank <= 5)
+            result["mixed_library_top5"] += int(rank is not None and rank <= 5)
             result["correct_library_source"] += int(top_source is source)
         else:
             result["local_positions"] += 1
             result["mixed_local_top1"] += int(rank == 1)
-            result["mixed_local_top5"] += int(rank <= 5)
+            result["mixed_local_top5"] += int(rank is not None and rank <= 5)
             result["correct_local_source"] += int(top_source is source)
     return result
 
@@ -171,6 +176,7 @@ def main(argv=None):
         "validation": {
             "pointer_only": _metrics(validation, 0),
             "train_selected_alpha": _metrics(validation, selected),
+            "source_preserving_alpha": _metrics(validation, selected, preserve_source=True),
         },
         "interpretation": "oracle tactic/prefix; available targets only; no complete-action or proof result",
     }

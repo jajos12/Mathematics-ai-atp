@@ -86,3 +86,20 @@ def test_collection_uses_true_tactic_and_prefix_on_cached_library_candidates():
     assert rows[0][1][rows[0][2]] == ("library", pytest.approx(0.9))
     assert _metrics(rows, 0)["library_positions"] == 1
     assert _metrics(rows, 3)["text_only_library_top1"] == 1
+
+
+def test_source_gate_preserves_local_decision_but_cannot_fix_source_errors():
+    samples = [
+        (np.asarray([2.0, 0.0, 1.0], dtype=np.float32),
+         [("local", None), ("library", 0.1), ("library", 0.9)], 0),
+        (np.asarray([2.0, 0.0, 1.0], dtype=np.float32),
+         [("local", None), ("library", 0.1), ("library", 0.9)], 2),
+    ]
+    global_blend = _metrics(samples, 8)
+    gated = _metrics(samples, 8, preserve_source=True)
+    assert global_blend["correct_local_source"] == 0
+    assert gated["correct_local_source"] == 1
+    assert gated["mixed_local_top1"] == 1
+    assert gated["library_only_top1"] == 1
+    assert gated["correct_library_source"] == 0
+    assert gated["mixed_library_top1"] == 0

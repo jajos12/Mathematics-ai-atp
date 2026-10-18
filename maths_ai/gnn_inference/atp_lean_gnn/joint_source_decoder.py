@@ -85,7 +85,7 @@ def gold_arguments_from_batch(batch) -> list[list[DecodedArgument]]:
 
 
 class JointSourceDecoder(nn.Module):
-    """GRU emits stop, source, then identity conditional on source."""
+    """Predict action length, then GRU source and identity for every slot."""
 
     def __init__(self, pointer: TacticWithArgsClassifier, *, text_dim: int) -> None:
         super().__init__()
@@ -98,6 +98,9 @@ class JointSourceDecoder(nn.Module):
         # probabilities, rather than an uncalibrated global text-score boost,
         # determine how local and library rankings meet.
         self.source_head = nn.Linear(hidden + 4, 2)
+        # Learn length even on rows whose gold library lemma is absent from
+        # retrieval. A binary stop head remains an auxiliary diagnostic only.
+        self.arg_count_head = nn.Linear(hidden, pointer.max_args + 1)
         self.log_inverse_text_temperature = nn.Parameter(torch.tensor(3.0))
         # A zero-initialized contextual residual preserves text order at epoch
         # zero, while allowing the GRU to choose a different second lemma.
@@ -108,6 +111,9 @@ class JointSourceDecoder(nn.Module):
             [tactic_id], device=state.device, dtype=torch.long,
         ))
         return self.pointer.argument_selector.initial_state(state.view(1, -1), tactic)
+
+    def count_logits(self, state: Tensor, tactic_id: int) -> Tensor:
+        return self.arg_count_head(self.initial_state(state, tactic_id)).view(-1)
 
     def score_step(self, hidden: Tensor, candidates: SourceCandidates, *, adapted: Tensor | None = None):
         if hidden.shape != (1, self.pointer.hidden_dim):
@@ -147,7 +153,7 @@ class JointSourceDecoder(nn.Module):
         raise ValueError("unknown argument source")
 
     def supervised_row(self, state: Tensor, tactic_id: int, candidates: SourceCandidates,
-                       gold: list[DecodedArgument]):
+                       gold: list[DecodedArgument], *, source_weights=(1.0, 1.0)):
         """Return loss/teacher-forced ranks only when every gold is reachable."""
         if len(gold) > self.pointer.max_args:
             raise ValueError("target action exceeds decoder argument budget")
@@ -164,6 +170,7 @@ class JointSourceDecoder(nn.Module):
         hidden = self.initial_state(state, tactic_id)
         stops, sources, identities = [], [], []
         source_hits = local_hits = library_hits = joint_hits = 0
+        local_source_hits = library_source_hits = 0
         frozen_text_hits = 0
         stop_hits = both_source_hits = both_source_positions = 0
         for argument, position in zip(gold, targets):
@@ -174,7 +181,7 @@ class JointSourceDecoder(nn.Module):
             stop_hits += int(stop_logit.item() < 0)
             source_logits, local_logits, library_logits = self.score_step(hidden, candidates, adapted=adapted)
             target_source = 0 if argument.source is CandidateSource.LOCAL else 1
-            sources.append(F.cross_entropy(source_logits.view(1, 2), torch.tensor(
+            sources.append(float(source_weights[target_source]) * F.cross_entropy(source_logits.view(1, 2), torch.tensor(
                 [target_source], device=hidden.device,
             )))
             logits = local_logits if target_source == 0 else library_logits
@@ -189,8 +196,10 @@ class JointSourceDecoder(nn.Module):
                 both_source_hits += source_hit
             joint_hits += source_hit * identity_hit
             if target_source == 0:
+                local_source_hits += source_hit
                 local_hits += identity_hit
             else:
+                library_source_hits += source_hit
                 library_hits += identity_hit
                 frozen_text_hits += int(candidates.lemma_scores.argmax().item() == position)
             hidden = self.pointer.argument_selector.gru(
@@ -207,22 +216,50 @@ class JointSourceDecoder(nn.Module):
             "library_positions": sum(x.source is CandidateSource.LIBRARY for x in gold),
             "source_top1": source_hits, "local_top1": local_hits,
             "library_top1": library_hits, "joint_top1": joint_hits,
+            "local_source_top1": local_source_hits,
+            "library_source_top1": library_source_hits,
             "frozen_text_top1": frozen_text_hits,
             "both_source_positions": both_source_positions, "both_source_hits": both_source_hits,
             "stop_decisions": len(gold) + 1, "stop_hits": stop_hits,
         }
 
+    def supervised_source_prefix(self, state: Tensor, tactic_id: int, candidates: SourceCandidates,
+                                 gold: list[DecodedArgument], *, source_weights=(1.0, 1.0)):
+        """Keep valid source labels before a retrieval-missing argument.
+
+        Identity and terminal stop are never supervised on unreachable gold.
+        A missing gold cannot feed the GRU, so later sources are also skipped.
+        """
+        local_positions = {node: i for i, node in enumerate(candidates.local_ids)}
+        library_positions = {lemma: i for i, lemma in enumerate(candidates.lemma_ids)}
+        adapted = self.lemma_adapter(candidates.lemma_vectors) if candidates.lemma_ids else None
+        hidden = self.initial_state(state, tactic_id)
+        losses = []
+        for argument in gold:
+            target_source = 0 if argument.source is CandidateSource.LOCAL else 1
+            if (target_source == 0 and not candidates.local_ids) or (target_source == 1 and not candidates.lemma_ids):
+                break
+            source_logits, _, _ = self.score_step(hidden, candidates, adapted=adapted)
+            losses.append(float(source_weights[target_source]) * F.cross_entropy(
+                source_logits.view(1, 2), torch.tensor([target_source], device=hidden.device),
+            ))
+            positions = local_positions if target_source == 0 else library_positions
+            position = positions.get(argument.stable_id)
+            if position is None:
+                break
+            hidden = self.pointer.argument_selector.gru(
+                self.selected_vector(candidates, argument.source, position, adapted=adapted), hidden,
+            )
+        return torch.stack(losses).mean() if losses else None
+
     @torch.no_grad()
     def decode(self, state: Tensor, tactic_id: int, candidates: SourceCandidates):
-        """Greedy flat action; return arguments and whether stop was explicit."""
+        """Greedy flat action with explicitly predicted argument count."""
         hidden = self.initial_state(state, tactic_id)
+        count = int(self.arg_count_head(hidden).argmax().item())
         adapted = None
         arguments = []
-        for _ in range(self.pointer.max_args + 1):
-            if bool((self.pointer.stop_head(hidden) >= 0).item()):
-                return tuple(arguments), True
-            if len(arguments) == self.pointer.max_args:
-                return tuple(arguments), False
+        for _ in range(count):
             if adapted is None and candidates.lemma_ids:
                 adapted = self.lemma_adapter(candidates.lemma_vectors)
             source_logits, local, library = self.score_step(hidden, candidates, adapted=adapted)
@@ -236,4 +273,4 @@ class JointSourceDecoder(nn.Module):
             hidden = self.pointer.argument_selector.gru(
                 self.selected_vector(candidates, source, position, adapted=adapted), hidden,
             )
-        raise AssertionError("decoder exceeded max_args")
+        return tuple(arguments), True

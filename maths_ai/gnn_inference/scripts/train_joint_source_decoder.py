@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +38,9 @@ def _atomic_json(path: Path, payload) -> None:
 
 def _metric_counts(totals: Counter, *, split: str) -> dict[str, float | int | str]:
     result: dict[str, float | int | str] = dict(totals)
+    for key in ("reachable_rows", "reachable_nonempty_rows", "missing_library_rows",
+                "missing_source_supervised_rows", "reachable_positions"):
+        result.setdefault(key, 0)
     def rate(numerator, denominator):
         return totals[numerator] / max(totals[denominator], 1)
 
@@ -44,29 +48,76 @@ def _metric_counts(totals: Counter, *, split: str) -> dict[str, float | int | st
         ("tactic_top1", "tactic_hits", "known_tactics"),
         ("retrieval_available_rate", "reachable_rows", "supported_rows"),
         ("nonempty_retrieval_available_rate", "reachable_nonempty_rows", "supported_nonempty_rows"),
+        ("argument_count_accuracy", "count_hits", "supported_rows"),
         ("source_top1", "source_hits", "reachable_positions"),
         ("source_top1_both_available", "both_source_hits", "both_source_positions"),
+        ("local_source_recall", "local_source_hits", "reachable_local_positions"),
+        ("library_source_recall", "library_source_hits", "reachable_library_positions"),
         ("stop_accuracy_teacher_forced", "stop_hits", "stop_decisions"),
         ("local_top1_given_local", "local_hits", "reachable_local_positions"),
         ("library_top1_given_library", "library_hits", "reachable_library_positions"),
         ("frozen_text_top1_given_library", "frozen_text_hits", "reachable_library_positions"),
         ("joint_argument_top1", "joint_hits", "reachable_positions"),
-        ("supported_action_exact", "predicted_action_exact", "supported_rows"),
-        ("oracle_tactic_action_exact", "oracle_action_exact", "supported_rows"),
-        ("nonempty_oracle_action_exact", "oracle_nonempty_exact", "supported_nonempty_rows"),
     ):
         result[name] = rate(numerator, denominator)
+    recalls = []
+    for count in range(4):
+        target = totals[f"gold_count_{count}"]
+        if target:
+            recall = totals[f"count_hit_{count}"] / target
+            recalls.append(recall)
+            result[f"gold_count_{count}_recall"] = recall
+    result["count_macro_recall"] = sum(recalls) / max(len(recalls), 1)
+    if split == "val":
+        for name, numerator, denominator in (
+            ("supported_action_exact", "predicted_action_exact", "supported_rows"),
+            ("oracle_tactic_action_exact", "oracle_action_exact", "supported_rows"),
+            ("nonempty_oracle_action_exact", "oracle_nonempty_exact", "supported_nonempty_rows"),
+        ):
+            result[name] = rate(numerator, denominator)
     result["split"] = split
     result["mean_reachable_loss"] = totals["loss_sum"] / max(totals["reachable_rows"], 1)
+    result["mean_argument_count_loss"] = totals["count_loss_sum"] / max(totals["supported_rows"], 1)
     return result
 
 
+def _supervision_weights(dataset, *, max_args: int):
+    """Count all supported labels, not only text-reachable training states."""
+    lengths = Counter()
+    sources = Counter()
+    for graph in dataset:
+        if not bool(graph.action_target_supported):
+            continue
+        length = int(graph.arg_count)
+        if not 0 <= length <= max_args:
+            raise ValueError("supported action length exceeds decoder budget")
+        lengths[length] += 1
+        sources["local"] += int((graph.arg_node_indices >= 0).sum())
+        sources["library"] += int((graph.arg_lemma_ids >= 0).sum())
+    if not lengths or not sources["local"] or not sources["library"]:
+        raise ValueError("joint training requires supported local and library targets")
+    weights = [
+        math.sqrt(sum(lengths.values()) / ((max_args + 1) * lengths[count]))
+        if lengths[count] else 1.0
+        for count in range(max_args + 1)
+    ]
+    local_weight = min(3.0, math.sqrt(sources["library"] / sources["local"]))
+    return weights, (local_weight, 1.0), {"lengths": dict(lengths), "sources": dict(sources)}
+
+
 def _run_epoch(model, loader, provider, *, split, device, k, optimizer=None,
-               start_batch=0, max_batches=0, on_progress=None, initial_counts=None):
+               start_batch=0, max_batches=0, on_progress=None, initial_counts=None,
+               count_weights=None, source_weights=(1.0, 1.0)):
     training = optimizer is not None
     model.train(training)
     model.pointer.backbone.eval()  # Freeze graph and tactic baseline in pilot.
     totals = Counter(initial_counts or {})
+    weights = torch.as_tensor(
+        [1.0] * (model.pointer.max_args + 1) if count_weights is None else count_weights,
+        dtype=torch.float32, device=device,
+    )
+    if weights.numel() != model.pointer.max_args + 1:
+        raise ValueError("argument-count weights must match decoder classes")
     amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
     for batch_index, batch in enumerate(loader):
         if max_batches and batch_index >= max_batches:
@@ -96,9 +147,28 @@ def _run_epoch(model, loader, provider, *, split, device, k, optimizer=None,
                     continue
                 totals["supported_rows"] += 1
                 totals["supported_nonempty_rows"] += int(bool(gold))
-                result = model.supervised_row(states[row], tactic_id, pool, gold)
+                length = len(gold)
+                count_logits = model.count_logits(states[row], tactic_id)
+                count_loss = weights[length] * torch.nn.functional.cross_entropy(
+                    count_logits.float().view(1, -1),
+                    torch.tensor([length], device=device),
+                )
+                losses.append(count_loss)
+                totals["count_loss_sum"] += float(count_loss.detach().item())
+                totals[f"gold_count_{length}"] += 1
+                count_hit = int(count_logits.argmax().item() == length)
+                totals[f"count_hit_{length}"] += count_hit
+                totals["count_hits"] += count_hit
+                result = model.supervised_row(states[row], tactic_id, pool, gold,
+                                              source_weights=source_weights)
                 if result is None:
                     totals["missing_library_rows"] += 1
+                    prefix_loss = model.supervised_source_prefix(
+                        states[row], tactic_id, pool, gold, source_weights=source_weights,
+                    )
+                    if prefix_loss is not None:
+                        losses.append(prefix_loss)
+                        totals["missing_source_supervised_rows"] += 1
                 else:
                     loss, metrics = result
                     losses.append(loss)
@@ -108,6 +178,8 @@ def _run_epoch(model, loader, provider, *, split, device, k, optimizer=None,
                     totals["reachable_local_positions"] += metrics["local_positions"]
                     totals["reachable_library_positions"] += metrics["library_positions"]
                     totals["source_hits"] += metrics["source_top1"]
+                    totals["local_source_hits"] += metrics["local_source_top1"]
+                    totals["library_source_hits"] += metrics["library_source_top1"]
                     totals["both_source_hits"] += metrics["both_source_hits"]
                     totals["both_source_positions"] += metrics["both_source_positions"]
                     totals["stop_hits"] += metrics["stop_hits"]
@@ -203,6 +275,11 @@ def main(argv=None):
         provider.validate_dataset(datasets[split], split=split)
     if any(getattr(loaders["val"].batch_sampler, "oversize_indices", [])):
         raise ValueError("validation graph budget excludes source rows; enlarge budget")
+    count_weights, source_weights, label_stats = _supervision_weights(
+        datasets["train"], max_args=config.max_args,
+    )
+    print(f"Training labels: {json.dumps(label_stats)}; count weights={count_weights}; "
+          f"source weights={source_weights}", flush=True)
     pointer = build_pointer_model(metadata, config)
     initialization = initialize_pointer_from_baseline_checkpoint(
         pointer, config=config, metadata=metadata, checkpoint_path=args.baseline_checkpoint,
@@ -214,7 +291,7 @@ def main(argv=None):
     config_policy = config.to_dict()
     config_policy["training"].pop("epochs")  # A resumed run may extend total epochs.
     binding = {
-        "model_type": "joint_source_flat_decoder_v1",
+        "model_type": "joint_source_flat_decoder_v2",
         "candidate_manifest_sha256": file_sha256(args.candidate_dir / "manifest.json"),
         "baseline_checkpoint_sha256": initialization["source_checkpoint_sha256"],
         "text_checkpoint_sha256": file_sha256(args.text_checkpoint),
@@ -223,7 +300,9 @@ def main(argv=None):
         "config": config_policy, "k": args.k,
         "batch_size": args.batch_size, "max_train_batches": args.max_train_batches,
         "learning_rate": args.learning_rate, "seed": args.seed,
-        "frozen_backbone": True, "library_ranking": "frozen_text_order",
+        "frozen_backbone": True, "library_ranking": "text_prior_with_contextual_residual",
+        "count_policy": "explicit_arity_sqrt_inverse_frequency_v1",
+        "count_weights": count_weights, "source_weights": list(source_weights),
     }
     root = args.run_dir
     if root.exists() and not args.resume:
@@ -236,7 +315,7 @@ def main(argv=None):
     epoch, phase, offset = 1, "ready", 0
     progress_counts = None
     completed_train_metrics = None
-    best = (-1.0, float("-inf"))
+    best = (-1.0, -1.0, float("-inf"))
     last_path = root / "last.pt"
     if args.resume and last_path.exists():
         saved_state = torch.load(last_path, map_location=device, weights_only=False)
@@ -252,11 +331,12 @@ def main(argv=None):
         best_path = root / "best.pt"
         if best_path.exists():
             best_metrics = torch.load(best_path, map_location="cpu", weights_only=False)["val_metrics"]
-            best = (best_metrics["nonempty_oracle_action_exact"], -best_metrics["mean_reachable_loss"])
+            best = (best_metrics["nonempty_oracle_action_exact"],
+                    best_metrics["count_macro_recall"], -best_metrics["mean_reachable_loss"])
 
     def save(stage, *, next_batch=0, metrics=None, train_metrics=None, train_counts=None):
         payload = {
-            "model_type": "joint_source_flat_decoder_v1", "binding": binding,
+            "model_type": "joint_source_flat_decoder_v2", "binding": binding,
             "epoch": epoch, "phase": stage, "next_batch": next_batch,
             "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
             "val_metrics": metrics, "train_metrics": train_metrics, "train_counts": train_counts,
@@ -276,6 +356,7 @@ def main(argv=None):
                 model, loaders["train"], provider, split="train", device=device, k=args.k,
                 optimizer=optimizer, start_batch=offset, max_batches=args.max_train_batches,
                 initial_counts=progress_counts,
+                count_weights=count_weights, source_weights=source_weights,
                 on_progress=lambda next_batch, counts: save("training", next_batch=next_batch, train_counts=counts),
             )
             print(f"epoch {epoch} train: {json.dumps(train_metrics)}", flush=True)
@@ -284,13 +365,15 @@ def main(argv=None):
             train_metrics = completed_train_metrics
         with torch.no_grad():
             val_metrics = _run_epoch(model, loaders["val"], provider,
-                                     split="val", device=device, k=args.k)
+                                     split="val", device=device, k=args.k,
+                                     count_weights=count_weights, source_weights=source_weights)
         if not val_metrics.get("reachable_nonempty_rows", 0):
             raise ValueError("no nonempty validation actions reachable in the frozen candidate pool")
         print(f"epoch {epoch} val: {json.dumps(val_metrics)}", flush=True)
         _atomic_json(root / f"metrics_epoch_{epoch}.json", {"train": train_metrics, "val": val_metrics})
         payload = save("complete", metrics=val_metrics, train_metrics=train_metrics)
-        score = (val_metrics["nonempty_oracle_action_exact"], -val_metrics["mean_reachable_loss"])
+        score = (val_metrics["nonempty_oracle_action_exact"],
+                 val_metrics["count_macro_recall"], -val_metrics["mean_reachable_loss"])
         if score > best:
             best = score
             torch.save(payload, root / "best.pt")

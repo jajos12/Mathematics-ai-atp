@@ -9,6 +9,15 @@ Library ordering starts as frozen text ranking, with a zero-initialized
 GRU-conditioned residual for later argument positions; no text-parser GNN
 lemma vectors are mixed with normalized local nodes.
 
+After the first pilot stopped after at most one argument, the revised decoder
+predicts **0–3 argument slots explicitly** from state and tactic. It trains
+this count on *all* supported actions, even when a cited lemma is absent from
+top 200. The old binary stop head remains an auxiliary diagnostic, not a
+greedy-length decision. Length classes receive smoothed inverse-frequency
+weights from training rows; local-source errors receive a training-only
+source weight. On retrieval misses, a reachable gold prefix can still teach
+its source, but missing identity and subsequent GRU/stop targets are masked.
+
 The corrected flat-action cohort contains 16,821 train / 322 val local and
 42,116 train / 802 val library positions (5,301 / 97 mixed-source actions).
 Unsupported syntax receives no argument or stop supervision. Retrieval-absent
@@ -46,20 +55,27 @@ python -u -m maths_ai.gnn_inference.scripts.train_joint_source_decoder \
   --corpus-path maths_ai/_support_files/artifacts/lemmas/v2/corpus/lemmas.jsonl \
   --baseline-checkpoint maths_ai/gnn_inference/runs/sexpr_available_old_settings/run_20261015_084134/best.pt \
   --pointer-config maths_ai/gnn_inference/configs/pointer_gat_state_mean_attention_pretrained.json \
-  --run-dir maths_ai/gnn_inference/runs/sexpr_joint_source_flat_epoch_5_pilot \
+  --run-dir maths_ai/gnn_inference/runs/sexpr_joint_source_flat_epoch_5_count_pilot \
   --device cuda:0 --epochs 1 --batch-size 32 --max-train-batches 500
 ```
 
-This first pilot freezes graph backbone and text retriever, training tactic
-embeddings, local pointer head, stop head, source gate and lemma adapter.
+Use this **new** run directory: the previous `joint_source_flat_decoder_v1`
+checkpoint has no count head and is not resumable as the revised v2 model.
+This pilot freezes graph backbone and text retriever, training tactic
+embeddings, local pointer head, count head, auxiliary stop head, source gate
+and lemma adapter.
 It resumes within an epoch using `--resume` with identical settings. To
 extend a completed run, keep every setting but increase `--epochs` and pass
-`--resume`. Its `best.pt` is selected by nonempty oracle-tactic action match
-on validation (reachable loss breaks ties), **not** by stop-only matches.
-Report retrieval-absent rows, both-sources-available source accuracy, stop
-accuracy, local/library candidate ranks, nonempty actions, and all supported
-actions separately. Compare library top-1 to frozen text ordering on the same
+`--resume`. Its `best.pt` is selected by nonempty oracle-tactic action match,
+then count macro recall and reachable loss, **not** by stop-only matches.
+Report retrieval-absent rows, both-sources-available source accuracy,
+auxiliary stop diagnostics, **per-length count recall**, local/library source
+recall and candidate ranks, nonempty actions, and all supported actions
+separately. Compare library top-1 to frozen text ordering on the same
 reachable argument positions; reject a learned rerank if it worsens that baseline.
+Training does not greedily decode actions, so exact-action scores are only
+reported for validation. Compare this **same-500-batch** run against v1 before
+starting a separate larger-data run (for example, 2,000 batches).
 
 The library pool currently searches the full corpus: declaration accessibility
 at the historical proof position remains unverified. Serving integration,

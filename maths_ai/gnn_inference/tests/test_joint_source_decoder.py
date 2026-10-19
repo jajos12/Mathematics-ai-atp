@@ -120,6 +120,13 @@ def test_count_and_source_weights_use_all_supported_labels():
     assert stats["sources"] == {"local": 1, "library": 3}
     assert weights[3] > weights[0]
     assert source_weights[0] > source_weights[1]
+    inverse, same_source_weights, same_stats = _supervision_weights(
+        data, max_args=3, count_exponent=1.0,
+    )
+    assert inverse[3] / inverse[0] > weights[3] / weights[0]
+    assert same_source_weights == source_weights and same_stats == stats
+    with pytest.raises(ValueError, match="exponent"):
+        _supervision_weights(data, max_args=3, count_exponent=1.5)
 
 
 def _graph(row, *, local, lemma):
@@ -334,6 +341,8 @@ def test_joint_runner_resumes_with_same_candidates_and_preserves_source_binding(
     with pytest.raises(ValueError, match="different data or training policy"):
         runner.main([*argv[:argv.index("--epochs")], "--epochs", "3", "--batch-size", "2",
                      "--k", "1", "--resume"])
+    with pytest.raises(ValueError, match="different data or training policy"):
+        runner.main([*argv, "--count-weight-exponent", "1.0", "--resume"])
     bindings["node_vocab_sha256"].write_text('{"FV0": 1}')
     with pytest.raises(ValueError, match="candidate source binding changed"):
         runner.main([*argv, "--resume"])

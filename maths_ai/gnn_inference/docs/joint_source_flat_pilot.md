@@ -77,6 +77,16 @@ Training does not greedily decode actions, so exact-action scores are only
 reported for validation. Compare this **same-500-batch** run against v1 before
 starting a separate larger-data run (for example, 2,000 batches).
 
+For a **controlled count-loss ablation** after V2's three epochs, repeat the
+same 500-batch/epoch command and seed with `--epochs 3`, add
+`--count-weight-exponent 1.0`, and use a **new** run directory such as
+`runs/sexpr_joint_source_flat_epoch_5_count_inverse_pilot`. Default `0.5`
+remains the original square-root inverse-frequency policy; `1.0` weights
+rare lengths more strongly from *training* counts only. It cannot resume the
+old V2 run because that would switch objectives mid-run. Compare count-2/3
+recall, zero/one losses, oracle/predicted nonempty exact, and source/identity
+on the same validation cohort; weight changes alone are not a proved fix.
+
 The library pool currently searches the full corpus: declaration accessibility
 at the historical proof position remains unverified. Serving integration,
 full syntax generation, same-live-state Pantograph parity and Lean-checked

@@ -81,8 +81,10 @@ def _metric_counts(totals: Counter, *, split: str) -> dict[str, float | int | st
     return result
 
 
-def _supervision_weights(dataset, *, max_args: int):
+def _supervision_weights(dataset, *, max_args: int, count_exponent: float = 0.5):
     """Count all supported labels, not only text-reachable training states."""
+    if not 0 <= count_exponent <= 1:
+        raise ValueError("count weighting exponent must be between zero and one")
     lengths = Counter()
     sources = Counter()
     for graph in dataset:
@@ -97,7 +99,7 @@ def _supervision_weights(dataset, *, max_args: int):
     if not lengths or not sources["local"] or not sources["library"]:
         raise ValueError("joint training requires supported local and library targets")
     weights = [
-        math.sqrt(sum(lengths.values()) / ((max_args + 1) * lengths[count]))
+        (sum(lengths.values()) / ((max_args + 1) * lengths[count])) ** count_exponent
         if lengths[count] else 1.0
         for count in range(max_args + 1)
     ]
@@ -228,10 +230,13 @@ def main(argv=None):
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--k", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--count-weight-exponent", type=float, default=0.5,
+                        help="0=uniform, 0.5=existing sqrt-inverse, 1=full inverse train frequency")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
-    if min(args.epochs, args.batch_size, args.k) < 1 or args.max_train_batches < 0 or args.learning_rate <= 0:
+    if (min(args.epochs, args.batch_size, args.k) < 1 or args.max_train_batches < 0
+            or args.learning_rate <= 0 or not 0 <= args.count_weight_exponent <= 1):
         raise ValueError("epochs, batch size, K, and learning rate must be valid")
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -277,6 +282,7 @@ def main(argv=None):
         raise ValueError("validation graph budget excludes source rows; enlarge budget")
     count_weights, source_weights, label_stats = _supervision_weights(
         datasets["train"], max_args=config.max_args,
+        count_exponent=args.count_weight_exponent,
     )
     print(f"Training labels: {json.dumps(label_stats)}; count weights={count_weights}; "
           f"source weights={source_weights}", flush=True)
@@ -304,6 +310,10 @@ def main(argv=None):
         "count_policy": "explicit_arity_sqrt_inverse_frequency_v1",
         "count_weights": count_weights, "source_weights": list(source_weights),
     }
+    # Keep existing V2 sqrt-weighted checkpoint bindings resumable unchanged.
+    if args.count_weight_exponent != 0.5:
+        binding["count_policy"] = "explicit_arity_power_inverse_frequency_v1"
+        binding["count_weight_exponent"] = args.count_weight_exponent
     root = args.run_dir
     if root.exists() and not args.resume:
         raise FileExistsError(f"joint run exists: {root}; pass --resume")

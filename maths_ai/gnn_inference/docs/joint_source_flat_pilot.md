@@ -97,12 +97,38 @@ proof search are separate gates before a composite bundle can be exported.
 `local_type_signals` compares normalized goal/hypothesis S-expressions: literal
 type equality for `exact`, and Eq/Iff/HEq side-in-goal for the **first** `rw`
 argument. A soft bonus of **8**, selected on training rows, improved local
-first-choice ranks on a small `exact`/`rw` validation subset; it is not a
-general Lean-validity rule. `SourceCandidates.local_type_signal` carries the
-per-local features; set `JointSourceDecoder.local_type_bonus_strength = 8`
+first-choice ranks on train and validation; it is not a general Lean-validity
+rule. `SourceCandidates.local_type_signal` carries per-local features; set
+`JointSourceDecoder.local_type_bonus_strength = 8`
 to test them. Default **0** preserves existing V2 checkpoints and scoring.
 The source gate receives the *original* local maxima, so the bonus changes
 within-local ranking only at position zero; later `rw` positions may use a
-different goal. Compare full-cohort local/complete-action outcomes using
-predicted tactic names where appropriate before integration. These offline
+different goal. Paired offline validation (same epoch-8 weights, bonus 0 vs 8):
+matched local top-1 **152→165/277**; oracle-tactic nonempty flat actions
+**64→72/759**, predicted-tactic nonempty **19→27/759**. Predicted-tactic
+features used the predicted family, not the gold family. These offline
 sidecars have not been verified against live Pantograph state fields (#42).
+
+### Local candidate signals by tactic
+
+One shared local scorer remains the default. Type signals are *soft features*
+for its candidates, with no-match fallback—not separate hard filters for each
+of the 214 tactic classes. Only the first two rows have measured rank gains:
+
+| Tactic/role | Candidate relationship to examine | Status |
+|---|---|---|
+| `exact` with a local proof | Hypothesis type literally equals goal; later test definitional equality | **Measured** for one-local actions; 13/26 val have a unique literal match, all 13 recorded gold |
+| First local `rw` | Eq/Iff/HEq side occurs within initial goal | **Measured**; first-local val rank 29→32/38 with soft bonus; 25/2,052 train rows would lose gold under hard filtering |
+| Later `rw`, `rewrite`, `rwa`, `simp_rw` | Equality relevant to goal *after preceding rewrites* | Hypothesis; initial-goal filter is unsafe; needs prefix/Lean-state evidence |
+| `simp`, `simpa`, `dsimp` | Rewrite/simplification relation, potentially conditional or implicit | Hypothesis; simple Eq substring match cannot cover simplifier behavior |
+| `apply`, `refine` | Candidate conclusion can elaborate/unify with goal, perhaps generating subgoals | Hypothesis; not literal equality; complex `refine` terms need syntax generation |
+| `cases`, `rcases`, `subst` | Destructible type or equality/variable role useful to current goal | Hypothesis; `subst` may take a variable or equality proof; no one rigid mask |
+| `use`, `exists` | Candidate term fits an existential witness or constructor argument | Hypothesis; needs goal structure and elaboration, not proof-type equality |
+| `intro`, `have`, `let` | Often introduce new names/goals instead of selecting an input local | Out of this flat local-pointer scope; requires syntax/binding generation |
+
+Next controlled work: compare a small set of reusable relationship features
+conditioned on tactic/argument position against the frozen local identity
+baseline (**152/277** before bonus). Check full-cohort and per-tactic gains,
+actual Lean validity of alternative hypotheses, and live normalized type
+parity before serving. Library top-200 ranking remains a separate task; no
+normalized type graph for every library declaration is assumed here.

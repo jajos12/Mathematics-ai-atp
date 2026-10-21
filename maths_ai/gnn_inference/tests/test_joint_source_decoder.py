@@ -1,6 +1,7 @@
 """Mixed-source arguments supervise stop and GRU with actual lemma embeddings."""
 
 import numpy as np
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -11,7 +12,7 @@ from torch_geometric.loader import DataLoader
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
 from maths_ai.gnn_inference.atp_lean_gnn.joint_source_decoder import (
     DecodedArgument, JointSourceDecoder, SourceCandidates,
-    candidate_groups_from_batch, gold_arguments_from_batch,
+    candidate_groups_from_batch, gold_arguments_from_batch, local_type_signals,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.premise_pool import CandidateSource
 from maths_ai.gnn_inference.scripts.train_joint_source_decoder import _run_epoch, _supervision_weights
@@ -72,6 +73,85 @@ def test_library_rank_can_depend_on_previous_gru_arguments():
     after_local = model.pointer.argument_selector.gru(candidates.local_vectors[0:1], hidden)
     _, _, second = model.score_step(after_local, candidates)
     assert not torch.allclose(first - second, torch.zeros_like(first))
+
+
+def test_type_cues_are_first_position_soft_scores_not_source_filters():
+    torch.manual_seed(24)
+    model = _model()
+    pool = SourceCandidates(
+        (1, 2, 3), torch.randn(3, 8),
+        (100, 101), torch.randn(2, 4), torch.tensor([0.9, 0.5]),
+    )
+    labels = torch.tensor([0, 10, 11, 12])
+    id_to_label = {10: "FV0", 11: "FV1", 12: "Hyp"}
+    hypotheses = [
+        {"context_index": 0, "sexp": "(:c P)"},
+        {"context_index": 1, "sexp": "(:c Q)"},
+    ]
+    exact = local_type_signals(
+        pool, labels, id_to_label, tactic_name="exact",
+        goal_sexp="(:c P)", hyp_sexps=hypotheses,
+    )
+    assert exact.tolist() == [1, 0, 0]
+    assert not local_type_signals(
+        pool, labels, id_to_label, tactic_name="cases",
+        goal_sexp="(:c P)", hyp_sexps=hypotheses,
+    ).any()
+
+    hidden = model.initial_state(torch.randn(8), 1)
+    with_bonus = replace(pool, local_type_signal=exact)
+    original_keys = set(model.state_dict())
+    baseline_source, baseline_local, baseline_library = model.score_step(hidden, pool)
+    model.local_type_bonus_strength = 8.0
+    source, local, library = model.score_step(hidden, with_bonus)
+    torch.testing.assert_close(source, baseline_source)
+    torch.testing.assert_close(library, baseline_library)
+    torch.testing.assert_close(local - baseline_local, 8 * exact)
+    _, second_local, _ = model.score_step(hidden, with_bonus, step=1)
+    torch.testing.assert_close(second_local, baseline_local)
+    assert set(model.state_dict()) == original_keys  # Old checkpoints still load.
+    with pytest.raises(ValueError, match="align uniquely"):
+        replace(pool, local_type_signal=torch.ones(1))
+    model.local_type_bonus_strength = -1.0
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        model.score_step(hidden, with_bonus)
+
+
+def test_rw_type_cue_matches_equality_side_but_not_unrelated_local():
+    pool = SourceCandidates((1, 2), torch.randn(2, 8),
+                            (100,), torch.randn(1, 4), torch.tensor([0.5]))
+    goal = "(:app (:c Eq) (:arg :implicit-type 0 (:c Nat)) (:arg :explicit 1 (:fv FV2)) (:arg :explicit 2 (:c Nat.zero)))"
+    hypotheses = [
+        {"context_index": 0, "sexp": "(:app (:c Eq) (:arg :implicit-type 0 (:c Nat)) (:arg :explicit 1 (:fv FV2)) (:arg :explicit 2 (:fv FV3)))"},
+        {"context_index": 1, "sexp": "(:app (:c Eq) (:arg :implicit-type 0 (:c Nat)) (:arg :explicit 1 (:fv FV4)) (:arg :explicit 2 (:fv FV5)))"},
+    ]
+    signals = local_type_signals(
+        pool, torch.tensor([0, 10, 11]), {10: "FV0", 11: "FV1"},
+        tactic_name="rw", goal_sexp=goal, hyp_sexps=hypotheses,
+    )
+    assert signals.tolist() == [1, 0]
+
+
+def test_type_bonus_changes_local_identity_after_unchanged_source_gate():
+    torch.manual_seed(91)
+    model = _model()
+    pool = _candidates()
+    with torch.no_grad():
+        model.arg_count_head.weight.zero_()
+        model.arg_count_head.bias.fill_(-10)
+        model.arg_count_head.bias[1] = 10
+        model.source_head.weight.zero_()
+        model.source_head.bias[:] = torch.tensor([10.0, -10.0])
+        model.pointer.argument_selector.out_proj.weight.zero_()
+        model.pointer.argument_selector.out_proj.bias.zero_()
+    state = torch.randn(8)
+    before, stopped = model.decode(state, 1, pool)
+    assert stopped and before == (DecodedArgument(CandidateSource.LOCAL, pool.local_ids[0]),)
+    model.local_type_bonus_strength = 8.0
+    after, stopped = model.decode(
+        state, 1, replace(pool, local_type_signal=torch.tensor([0.0, 1.0])),
+    )
+    assert stopped and after == (DecodedArgument(CandidateSource.LOCAL, pool.local_ids[1]),)
 
 
 def test_unretrieved_library_target_never_becomes_zero_argument_stop():

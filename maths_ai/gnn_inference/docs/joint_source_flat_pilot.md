@@ -91,3 +91,18 @@ The library pool currently searches the full corpus: declaration accessibility
 at the historical proof position remains unverified. Serving integration,
 full syntax generation, same-live-state Pantograph parity and Lean-checked
 proof search are separate gates before a composite bundle can be exported.
+
+### Optional local type cue (offline experiment only)
+
+`local_type_signals` compares normalized goal/hypothesis S-expressions: literal
+type equality for `exact`, and Eq/Iff/HEq side-in-goal for the **first** `rw`
+argument. A soft bonus of **8**, selected on training rows, improved local
+first-choice ranks on a small `exact`/`rw` validation subset; it is not a
+general Lean-validity rule. `SourceCandidates.local_type_signal` carries the
+per-local features; set `JointSourceDecoder.local_type_bonus_strength = 8`
+to test them. Default **0** preserves existing V2 checkpoints and scoring.
+The source gate receives the *original* local maxima, so the bonus changes
+within-local ranking only at position zero; later `rw` positions may use a
+different goal. Compare full-cohort local/complete-action outcomes using
+predicted tactic names where appropriate before integration. These offline
+sidecars have not been verified against live Pantograph state fields (#42).

@@ -7,6 +7,8 @@ This decoder does not synthesize compound Lean tactic syntax.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 
 import torch
@@ -14,6 +16,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .argument_selector import TacticWithArgsClassifier
+from .graph import parse_sexp_string
 from .premise_pool import CandidateSource
 
 
@@ -24,6 +27,7 @@ class SourceCandidates:
     lemma_ids: tuple[int, ...]
     lemma_vectors: Tensor  # Frozen text index vectors, before projection.
     lemma_scores: Tensor   # Frozen retrieval cosine scores.
+    local_type_signal: Tensor | None = None  # Optional first-position soft evidence.
 
     def __post_init__(self):
         if (self.local_vectors.ndim != 2 or self.lemma_vectors.ndim != 2
@@ -32,7 +36,12 @@ class SourceCandidates:
                 or len(self.lemma_ids) != self.lemma_vectors.size(0)
                 or len(self.lemma_ids) != self.lemma_scores.numel()
                 or len(set(self.local_ids)) != len(self.local_ids)
-                or len(set(self.lemma_ids)) != len(self.lemma_ids)):
+                or len(set(self.lemma_ids)) != len(self.lemma_ids)
+                or (self.local_type_signal is not None and (
+                    self.local_type_signal.ndim != 1
+                    or self.local_type_signal.numel() != len(self.local_ids)
+                    or not bool(torch.isfinite(self.local_type_signal).all())
+                ))):
             raise ValueError("candidate IDs, vectors, and text scores must align uniquely")
 
 
@@ -40,6 +49,52 @@ class SourceCandidates:
 class DecodedArgument:
     source: CandidateSource
     stable_id: int
+
+
+def _contains_subexpression(tree, expression) -> bool:
+    pending = [tree]
+    while pending:
+        current = pending.pop()
+        if current == expression:
+            return True
+        if isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def local_type_signals(candidates: SourceCandidates, node_labels: Tensor,
+                       id_to_label: dict[int, str], *, tactic_name: str,
+                       goal_sexp: str, hyp_sexps: list[dict]) -> Tensor:
+    """Conservative exact/rw type cues, without filtering candidate identities.
+
+    Only the first argument position may use `rw`'s initial goal: later
+    rewrites may operate on a goal changed by earlier arguments.
+    """
+    values = candidates.local_vectors.new_zeros(len(candidates.local_ids))
+    if tactic_name not in {"exact", "rw"}:
+        return values
+    hypotheses = {f"FV{int(h['context_index'])}": h for h in hyp_sexps}
+    goal = parse_sexp_string(goal_sexp) if tactic_name == "rw" else None
+    for position, node_id in enumerate(candidates.local_ids):
+        label = id_to_label.get(int(node_labels[node_id]), "")
+        if not re.fullmatch(r"FV\d+", label):
+            continue
+        hypothesis = hypotheses.get(label)
+        if hypothesis is None or not isinstance(hypothesis.get("sexp"), str):
+            continue
+        if tactic_name == "exact":
+            values[position] = float(hypothesis["sexp"] == goal_sexp)
+            continue
+        relation = parse_sexp_string(hypothesis["sexp"])
+        if (not isinstance(relation, list) or len(relation) < 4 or relation[0] != ":app"
+                or relation[1] not in ([":c", "Eq"], [":c", "Iff"], [":c", "HEq"])):
+            continue
+        explicit = [item[3] for item in relation[2:]
+                    if isinstance(item, list) and len(item) == 4
+                    and item[0] == ":arg" and item[1] == ":explicit"]
+        if len(explicit) >= 2 and any(_contains_subexpression(goal, side) for side in explicit[-2:]):
+            values[position] = 1.0
+    return values
 
 
 def candidate_groups_from_batch(batch, node_embeddings: Tensor, library_ids,
@@ -105,6 +160,9 @@ class JointSourceDecoder(nn.Module):
         # A zero-initialized contextual residual preserves text order at epoch
         # zero, while allowing the GRU to choose a different second lemma.
         self.library_residual_scale = nn.Parameter(torch.zeros(()))
+        # Runtime-only experiment setting. No new checkpoint tensor: V2's
+        # state_dict remains compatible, and the default is unchanged.
+        self.local_type_bonus_strength = 0.0
 
     def initial_state(self, state: Tensor, tactic_id: int) -> Tensor:
         tactic = self.pointer.tactic_embedding(torch.tensor(
@@ -115,7 +173,8 @@ class JointSourceDecoder(nn.Module):
     def count_logits(self, state: Tensor, tactic_id: int) -> Tensor:
         return self.arg_count_head(self.initial_state(state, tactic_id)).view(-1)
 
-    def score_step(self, hidden: Tensor, candidates: SourceCandidates, *, adapted: Tensor | None = None):
+    def score_step(self, hidden: Tensor, candidates: SourceCandidates, *,
+                   adapted: Tensor | None = None, step: int = 0):
         if hidden.shape != (1, self.pointer.hidden_dim):
             raise ValueError("one decoder state is required")
         if candidates.local_vectors.size(1) != self.pointer.hidden_dim:
@@ -141,6 +200,13 @@ class JointSourceDecoder(nn.Module):
             source = source.masked_fill(torch.tensor([True, False], device=source.device), float("-inf"))
         if not candidates.lemma_ids:
             source = source.masked_fill(torch.tensor([False, True], device=source.device), float("-inf"))
+        if (step == 0 and candidates.local_type_signal is not None
+                and self.local_type_bonus_strength):
+            if not math.isfinite(self.local_type_bonus_strength) or self.local_type_bonus_strength < 0:
+                raise ValueError("local type bonus must be finite and nonnegative")
+            local = local + self.local_type_bonus_strength * candidates.local_type_signal.to(
+                device=local.device, dtype=local.dtype,
+            )
         return source, local, library
 
     def selected_vector(self, candidates: SourceCandidates, source: CandidateSource, position: int,
@@ -173,13 +239,15 @@ class JointSourceDecoder(nn.Module):
         local_source_hits = library_source_hits = 0
         frozen_text_hits = 0
         stop_hits = both_source_hits = both_source_positions = 0
-        for argument, position in zip(gold, targets):
+        for step, (argument, position) in enumerate(zip(gold, targets)):
             stop_logit = self.pointer.stop_head(hidden).view(())
             stops.append(F.binary_cross_entropy_with_logits(
                 stop_logit, hidden.new_zeros(()),
             ))
             stop_hits += int(stop_logit.item() < 0)
-            source_logits, local_logits, library_logits = self.score_step(hidden, candidates, adapted=adapted)
+            source_logits, local_logits, library_logits = self.score_step(
+                hidden, candidates, adapted=adapted, step=step,
+            )
             target_source = 0 if argument.source is CandidateSource.LOCAL else 1
             sources.append(float(source_weights[target_source]) * F.cross_entropy(source_logits.view(1, 2), torch.tensor(
                 [target_source], device=hidden.device,
@@ -235,11 +303,11 @@ class JointSourceDecoder(nn.Module):
         adapted = self.lemma_adapter(candidates.lemma_vectors) if candidates.lemma_ids else None
         hidden = self.initial_state(state, tactic_id)
         losses = []
-        for argument in gold:
+        for step, argument in enumerate(gold):
             target_source = 0 if argument.source is CandidateSource.LOCAL else 1
             if (target_source == 0 and not candidates.local_ids) or (target_source == 1 and not candidates.lemma_ids):
                 break
-            source_logits, _, _ = self.score_step(hidden, candidates, adapted=adapted)
+            source_logits, _, _ = self.score_step(hidden, candidates, adapted=adapted, step=step)
             losses.append(float(source_weights[target_source]) * F.cross_entropy(
                 source_logits.view(1, 2), torch.tensor([target_source], device=hidden.device),
             ))
@@ -259,10 +327,12 @@ class JointSourceDecoder(nn.Module):
         count = int(self.arg_count_head(hidden).argmax().item())
         adapted = None
         arguments = []
-        for _ in range(count):
+        for step in range(count):
             if adapted is None and candidates.lemma_ids:
                 adapted = self.lemma_adapter(candidates.lemma_vectors)
-            source_logits, local, library = self.score_step(hidden, candidates, adapted=adapted)
+            source_logits, local, library = self.score_step(
+                hidden, candidates, adapted=adapted, step=step,
+            )
             if not torch.isfinite(source_logits).any():
                 return tuple(arguments), False
             source = CandidateSource.LOCAL if int(source_logits.argmax()) == 0 else CandidateSource.LIBRARY

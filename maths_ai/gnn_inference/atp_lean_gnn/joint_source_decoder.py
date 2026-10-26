@@ -28,6 +28,7 @@ class SourceCandidates:
     lemma_vectors: Tensor  # Frozen text index vectors, before projection.
     lemma_scores: Tensor   # Frozen retrieval cosine scores.
     local_type_signal: Tensor | None = None  # Optional first-position soft evidence.
+    local_type_tactic: str | None = None  # Family used to construct the optional signal.
 
     def __post_init__(self):
         if (self.local_vectors.ndim != 2 or self.lemma_vectors.ndim != 2
@@ -65,16 +66,17 @@ def _contains_subexpression(tree, expression) -> bool:
 def local_type_signals(candidates: SourceCandidates, node_labels: Tensor,
                        id_to_label: dict[int, str], *, tactic_name: str,
                        goal_sexp: str, hyp_sexps: list[dict]) -> Tensor:
-    """Conservative exact/rw type cues, without filtering candidate identities.
+    """Conservative first-position type cues, without filtering identities.
 
-    Only the first argument position may use `rw`'s initial goal: later
-    rewrites may operate on a goal changed by earlier arguments.
+    `rw`, `simp` and `subst` share an Eq/Iff/HEq side-in-goal feature.
+    It is soft evidence, not tactic applicability. Later arguments may
+    operate on a goal changed by earlier arguments.
     """
     values = candidates.local_vectors.new_zeros(len(candidates.local_ids))
-    if tactic_name not in {"exact", "rw"}:
+    if tactic_name not in {"exact", "rw", "simp", "subst"}:
         return values
     hypotheses = {f"FV{int(h['context_index'])}": h for h in hyp_sexps}
-    goal = parse_sexp_string(goal_sexp) if tactic_name == "rw" else None
+    goal = parse_sexp_string(goal_sexp) if tactic_name != "exact" else None
     for position, node_id in enumerate(candidates.local_ids):
         label = id_to_label.get(int(node_labels[node_id]), "")
         if not re.fullmatch(r"FV\d+", label):
@@ -163,6 +165,24 @@ class JointSourceDecoder(nn.Module):
         # Runtime-only experiment setting. No new checkpoint tensor: V2's
         # state_dict remains compatible, and the default is unchanged.
         self.local_type_bonus_strength = 0.0
+        self.local_type_bonus_strengths: dict[str, float] = {}
+        # Opt-in library-only query: old V2 state dicts remain unchanged.
+        self.library_query = None
+
+    def enable_library_identity(self) -> None:
+        """Add an independent, zero-initialized library correction in place.
+
+        Load an existing V2 checkpoint before enabling this component. New
+        library-identity checkpoints require enabling it before strict load.
+        """
+        if self.library_query is None:
+            reference = self.source_head.weight
+            self.library_query = nn.Linear(
+                self.pointer.hidden_dim, self.pointer.hidden_dim,
+                device=reference.device, dtype=reference.dtype,
+            )
+            nn.init.zeros_(self.library_query.weight)
+            nn.init.zeros_(self.library_query.bias)
 
     def initial_state(self, state: Tensor, tactic_id: int) -> Tensor:
         tactic = self.pointer.tactic_embedding(torch.tensor(
@@ -200,11 +220,18 @@ class JointSourceDecoder(nn.Module):
             source = source.masked_fill(torch.tensor([True, False], device=source.device), float("-inf"))
         if not candidates.lemma_ids:
             source = source.masked_fill(torch.tensor([False, True], device=source.device), float("-inf"))
-        if (step == 0 and candidates.local_type_signal is not None
-                and self.local_type_bonus_strength):
-            if not math.isfinite(self.local_type_bonus_strength) or self.local_type_bonus_strength < 0:
+        # Keep source evidence at the frozen legacy scores. This component
+        # trains within-library identity, independently of the local query.
+        if self.library_query is not None and candidates.lemma_ids:
+            correction = adapted @ self.library_query(hidden).view(-1)
+            library = library + correction / math.sqrt(self.pointer.hidden_dim)
+        strength = self.local_type_bonus_strengths.get(
+            candidates.local_type_tactic, self.local_type_bonus_strength,
+        )
+        if step == 0 and candidates.local_type_signal is not None and strength:
+            if not math.isfinite(strength) or strength < 0:
                 raise ValueError("local type bonus must be finite and nonnegative")
-            local = local + self.local_type_bonus_strength * candidates.local_type_signal.to(
+            local = local + strength * candidates.local_type_signal.to(
                 device=local.device, dtype=local.dtype,
             )
         return source, local, library

@@ -46,3 +46,28 @@ The experiment does not train library ranking or full tactic syntax.
 The pointer projection is shared with the joint decoder's contextual library
 residual: **do not swap these weights into serving** without rechecking
 library ranking, source choice and complete actions on the matched cohort.
+
+## Experiment-cycle outcome
+
+Eight-epoch server run trained on **16,816/16,821** supported local train
+positions (five oversized exclusions). Best epoch 8 improved matched val
+local top-1 **130→152/277**, all-supported local **155→182/322**, with graph,
+tactic embedding, GRU and text adapter frozen. Optional first-slot
+`exact=8, rw=8, simp=4` cues then gave **167/277** matched local identity,
+**73/759** oracle-tactic nonempty exact flat actions and **27/759**
+predicted-tactic nonempty exact. These are offline imitation metrics.
+
+Final paired comparison added train-selected first-slot `subst=8`; its
+standalone rank test gives **390→426/623 train**, **6→8/13 val**, with
+21 train harms and no observed val harms. Full validation reproduced the
+three-family reference, then improved matched local identity **167→169/277**
+and oracle nonempty exact **73→75/759** (both 2 rescues / 0 harms).
+Predicted nonempty exact stayed **27/759**, supported predicted exact
+**206/1,207**. Retain the four-family configuration as optional, default-off.
+
+**Offline experiment cycle complete.** Relative to the same epoch-8 scorer
+without cues: local identity **152→169/277**, oracle nonempty exact
+**64→75/759**, predicted nonempty exact **19→27/759**. There are still
+108 wrong matched local identities; later-operand/type-unification work and
+live Lean checking are follow-ups, not proof-success claims.
+See [pilot results and final settings](joint_source_flat_pilot.md).

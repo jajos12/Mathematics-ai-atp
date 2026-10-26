@@ -75,6 +75,62 @@ def test_library_rank_can_depend_on_previous_gru_arguments():
     assert not torch.allclose(first - second, torch.zeros_like(first))
 
 
+def test_independent_library_query_starts_at_baseline_and_learns_without_local_changes():
+    torch.manual_seed(149)
+    model = _model()
+    pool = _candidates()
+    hidden = model.initial_state(torch.randn(8), 1).detach()
+    baseline = tuple(value.detach().clone() for value in model.score_step(hidden, pool))
+    original = {key: value.clone() for key, value in model.state_dict().items()}
+    model.enable_library_identity()
+    for before, after in zip(baseline, model.score_step(hidden, pool)):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+    model.requires_grad_(False)
+    model.library_query.requires_grad_(True)
+    optimizer = torch.optim.AdamW(model.library_query.parameters(), lr=0.1)
+    _, _, logits = model.score_step(hidden, pool)
+    loss = torch.nn.functional.cross_entropy(logits.view(1, -1), torch.tensor([1]))
+    loss.backward()
+    assert model.library_query.weight.grad.abs().sum() > 0  # No zero gate blocks learning.
+    optimizer.step()
+    source, local, changed = model.score_step(hidden, pool)
+    torch.testing.assert_close(source, baseline[0], rtol=0, atol=0)
+    torch.testing.assert_close(local, baseline[1], rtol=0, atol=0)
+    assert changed[1] - changed[0] > baseline[2][1] - baseline[2][0]
+    for key, value in original.items():
+        torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+    with torch.no_grad():
+        adapted = model.lemma_adapter(pool.lemma_vectors)
+        model.library_query.bias.copy_(100 * (adapted[1] - adapted[0]))
+    source, local, reranked = model.score_step(hidden, pool)
+    assert reranked.argmax().item() == 1
+    torch.testing.assert_close(source, baseline[0], rtol=0, atol=0)
+    torch.testing.assert_close(local, baseline[1], rtol=0, atol=0)
+    saved = model.state_dict()
+    restored = _model()
+    restored.enable_library_identity()
+    restored.load_state_dict(saved, strict=True)
+    for before, after in zip(model.score_step(hidden, pool), restored.score_step(hidden, pool)):
+        torch.testing.assert_close(before, after)
+
+
+def test_independent_library_query_can_use_prefix_and_preserves_genuine_repeats():
+    torch.manual_seed(150)
+    model = _model()
+    model.enable_library_identity()
+    with torch.no_grad():
+        model.library_query.weight.copy_(torch.eye(8))
+    pool = _candidates()
+    hidden = model.initial_state(torch.randn(8), 1)
+    next_hidden = model.pointer.argument_selector.gru(pool.local_vectors[0:1], hidden)
+    _, _, first = model.score_step(hidden, pool)
+    _, _, second = model.score_step(next_hidden, pool, step=1)
+    assert not torch.allclose(first, second)
+    gold = [DecodedArgument(CandidateSource.LIBRARY, 100)] * 2
+    loss, metrics = model.supervised_row(torch.randn(8), 1, pool, gold)
+    assert loss.isfinite() and metrics["library_positions"] == 2
+
+
 def test_type_cues_are_first_position_soft_scores_not_source_filters():
     torch.manual_seed(24)
     model = _model()
@@ -117,7 +173,8 @@ def test_type_cues_are_first_position_soft_scores_not_source_filters():
         model.score_step(hidden, with_bonus)
 
 
-def test_rw_type_cue_matches_equality_side_but_not_unrelated_local():
+@pytest.mark.parametrize("tactic", ["rw", "simp", "subst"])
+def test_relation_type_cue_matches_equality_side_but_not_unrelated_local(tactic):
     pool = SourceCandidates((1, 2), torch.randn(2, 8),
                             (100,), torch.randn(1, 4), torch.tensor([0.5]))
     goal = "(:app (:c Eq) (:arg :implicit-type 0 (:c Nat)) (:arg :explicit 1 (:fv FV2)) (:arg :explicit 2 (:c Nat.zero)))"
@@ -127,9 +184,38 @@ def test_rw_type_cue_matches_equality_side_but_not_unrelated_local():
     ]
     signals = local_type_signals(
         pool, torch.tensor([0, 10, 11]), {10: "FV0", 11: "FV1"},
-        tactic_name="rw", goal_sexp=goal, hyp_sexps=hypotheses,
+        tactic_name=tactic, goal_sexp=goal, hyp_sexps=hypotheses,
     )
     assert signals.tolist() == [1, 0]
+    assert not local_type_signals(
+        pool, torch.tensor([0, 10, 11]), {10: "FV0", 11: "FV1"},
+        tactic_name=tactic, goal_sexp=goal,
+        hyp_sexps=[{"context_index": 0, "sexp": "(:c P)"},
+                   {"context_index": 1, "sexp": "(:c Q)"}],
+    ).any()
+
+
+def test_tactic_specific_soft_bonus_preserves_source_and_other_tactics():
+    torch.manual_seed(117)
+    model = _model()
+    pool = replace(_candidates(), local_type_signal=torch.tensor([0.0, 1.0]))
+    hidden = model.initial_state(torch.randn(8), 1)
+    keys = set(model.state_dict())
+    original_source, original_local, original_library = model.score_step(hidden, pool)
+    model.local_type_bonus_strengths = {"exact": 8.0, "rw": 8.0, "simp": 4.0, "subst": 8.0}
+    for tactic, expected in (("exact", 8.0), ("rw", 8.0), ("simp", 4.0),
+                             ("subst", 8.0), ("cases", 0.0)):
+        family_pool = replace(pool, local_type_tactic=tactic)
+        source, local, library = model.score_step(hidden, family_pool)
+        torch.testing.assert_close(source, original_source)
+        torch.testing.assert_close(library, original_library)
+        torch.testing.assert_close(local - original_local, torch.tensor([0.0, expected]))
+        _, later_local, _ = model.score_step(hidden, family_pool, step=1)
+        torch.testing.assert_close(later_local, original_local)
+    assert set(model.state_dict()) == keys
+    model.local_type_bonus_strengths["simp"] = -1.0
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        model.score_step(hidden, replace(pool, local_type_tactic="simp"))
 
 
 def test_type_bonus_changes_local_identity_after_unchanged_source_gate():

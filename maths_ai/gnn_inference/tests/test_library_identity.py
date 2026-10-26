@@ -51,7 +51,8 @@ def _provider():
     return Provider()
 
 
-def test_missing_library_prefix_teaches_later_retrieved_identity_without_injection():
+@pytest.mark.parametrize("key_space", ["adapted", "text"])
+def test_missing_library_prefix_teaches_later_retrieved_identity_without_injection(key_space):
     torch.manual_seed(215)
     graphs = [_graph(7, [-1, -1], [999, 100]),
               _graph(9, [2, -1], [-1, 101]), _graph(11, [-1], [999])]
@@ -62,7 +63,7 @@ def test_missing_library_prefix_teaches_later_retrieved_identity_without_injecti
                             lemma_vectors=np.eye(4, dtype=np.float32)[:3])
     model = _model()
     original = {key: value.clone() for key, value in model.state_dict().items()}
-    model.enable_library_identity()
+    model.enable_library_identity(key_space=key_space)
     model.requires_grad_(False)
     model.library_query.requires_grad_(True)
     captured = []
@@ -245,6 +246,13 @@ def test_runner_preserves_epoch_zero_and_resume_binding(tmp_path, monkeypatch):
         runner.main([*argv, "--learning-rate", "0.1", "--resume"])
     with pytest.raises(ValueError, match="cohort changed"):
         runner.main([*argv, "--expected-val-matched", "9", "--resume"])
+    with pytest.raises(ValueError, match="changed data or training policy"):
+        runner.main([*argv, "--library-key-space", "text", "--resume"])
+    text_run = tmp_path / "text_run"
+    assert runner.main([*argv, "--run-dir", str(text_run), "--library-key-space", "text"]) == 0
+    text_saved = torch.load(text_run / "last.pt", map_location="cpu", weights_only=False)
+    assert text_saved["binding"]["library_key_space"] == "text"
+    assert text_saved["model_state_dict"]["library_query.weight"].shape == (4, 8)
     paths["node_vocab_sha256"].write_text('{"different": 1}')
     # Snapshot manifest is bound, not recomputed from changed sources.
     previous_provider = Provider.__init__

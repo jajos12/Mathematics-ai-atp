@@ -168,21 +168,29 @@ class JointSourceDecoder(nn.Module):
         self.local_type_bonus_strengths: dict[str, float] = {}
         # Opt-in library-only query: old V2 state dicts remain unchanged.
         self.library_query = None
+        self.library_key_space = "adapted"
 
-    def enable_library_identity(self) -> None:
+    def enable_library_identity(self, *, key_space: str = "adapted") -> None:
         """Add an independent, zero-initialized library correction in place.
 
         Load an existing V2 checkpoint before enabling this component. New
-        library-identity checkpoints require enabling it before strict load.
+        library-identity checkpoints require the same key space before strict
+        load. Original-text keys affect scoring only, never GRU inputs.
         """
+        if key_space not in {"adapted", "text"}:
+            raise ValueError("library key space must be adapted or text")
+        if self.library_query is not None and key_space != self.library_key_space:
+            raise ValueError("cannot change key space of an enabled library query")
         if self.library_query is None:
             reference = self.source_head.weight
+            dimension = self.pointer.hidden_dim if key_space == "adapted" else self.lemma_adapter[0].in_features
             self.library_query = nn.Linear(
-                self.pointer.hidden_dim, self.pointer.hidden_dim,
+                self.pointer.hidden_dim, dimension,
                 device=reference.device, dtype=reference.dtype,
             )
             nn.init.zeros_(self.library_query.weight)
             nn.init.zeros_(self.library_query.bias)
+            self.library_key_space = key_space
 
     def initial_state(self, state: Tensor, tactic_id: int) -> Tensor:
         tactic = self.pointer.tactic_embedding(torch.tensor(
@@ -223,8 +231,14 @@ class JointSourceDecoder(nn.Module):
         # Keep source evidence at the frozen legacy scores. This component
         # trains within-library identity, independently of the local query.
         if self.library_query is not None and candidates.lemma_ids:
-            correction = adapted @ self.library_query(hidden).view(-1)
-            library = library + correction / math.sqrt(self.pointer.hidden_dim)
+            if self.library_key_space == "text":
+                # Unit-norm keys already have coordinate scale ~1/sqrt(dim).
+                keys = F.normalize(candidates.lemma_vectors, dim=-1)
+                correction = keys @ self.library_query(hidden).view(-1)
+            else:
+                correction = adapted @ self.library_query(hidden).view(-1)
+                correction = correction / math.sqrt(self.pointer.hidden_dim)
+            library = library + correction
         strength = self.local_type_bonus_strengths.get(
             candidates.local_type_tactic, self.local_type_bonus_strength,
         )

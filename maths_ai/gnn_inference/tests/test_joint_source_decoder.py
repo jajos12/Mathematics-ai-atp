@@ -75,14 +75,15 @@ def test_library_rank_can_depend_on_previous_gru_arguments():
     assert not torch.allclose(first - second, torch.zeros_like(first))
 
 
-def test_independent_library_query_starts_at_baseline_and_learns_without_local_changes():
+@pytest.mark.parametrize("key_space", ["adapted", "text"])
+def test_independent_library_query_starts_at_baseline_and_learns_without_local_changes(key_space):
     torch.manual_seed(149)
     model = _model()
     pool = _candidates()
     hidden = model.initial_state(torch.randn(8), 1).detach()
     baseline = tuple(value.detach().clone() for value in model.score_step(hidden, pool))
     original = {key: value.clone() for key, value in model.state_dict().items()}
-    model.enable_library_identity()
+    model.enable_library_identity(key_space=key_space)
     for before, after in zip(baseline, model.score_step(hidden, pool)):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
     model.requires_grad_(False)
@@ -100,18 +101,32 @@ def test_independent_library_query_starts_at_baseline_and_learns_without_local_c
     for key, value in original.items():
         torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
     with torch.no_grad():
-        adapted = model.lemma_adapter(pool.lemma_vectors)
-        model.library_query.bias.copy_(100 * (adapted[1] - adapted[0]))
+        keys = (torch.nn.functional.normalize(pool.lemma_vectors, dim=-1)
+                if key_space == "text" else model.lemma_adapter(pool.lemma_vectors))
+        model.library_query.bias.copy_(100 * (keys[1] - keys[0]))
     source, local, reranked = model.score_step(hidden, pool)
     assert reranked.argmax().item() == 1
     torch.testing.assert_close(source, baseline[0], rtol=0, atol=0)
     torch.testing.assert_close(local, baseline[1], rtol=0, atol=0)
     saved = model.state_dict()
     restored = _model()
-    restored.enable_library_identity()
+    restored.enable_library_identity(key_space=key_space)
     restored.load_state_dict(saved, strict=True)
     for before, after in zip(model.score_step(hidden, pool), restored.score_step(hidden, pool)):
         torch.testing.assert_close(before, after)
+
+
+def test_library_key_space_is_explicit_and_cannot_silently_replace_trained_query():
+    model = _model()
+    with pytest.raises(ValueError, match="key space"):
+        model.enable_library_identity(key_space="unknown")
+    model.enable_library_identity(key_space="text")
+    query = model.library_query
+    model.enable_library_identity(key_space="text")
+    assert model.library_query is query
+    assert query.out_features == 4  # Original text width, not hidden width 8.
+    with pytest.raises(ValueError, match="cannot change key space"):
+        model.enable_library_identity(key_space="adapted")
 
 
 def test_independent_library_query_can_use_prefix_and_preserves_genuine_repeats():

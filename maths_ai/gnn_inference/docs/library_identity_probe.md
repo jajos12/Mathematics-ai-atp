@@ -60,7 +60,7 @@ supervision without candidate injection, all-missing identity masking,
 strict checkpoint reload, resume-policy rejection and exact interrupted-
 versus-uninterrupted query training.
 
-## Server pilot
+## First pilot command (completed)
 
 Sync edited code and the new training script first. Check disk/GPU space;
 no new retrieval caches or embeddings are generated. Use a new run directory.
@@ -100,4 +100,58 @@ evaluation using finalized local cues: reference local **169/277**, oracle
 nonempty **75/759**, predicted nonempty **27/759**. Report library gains and
 harms plus complete-action/source/local regressions before any serving use.
 This probe does not address retrieval misses, live accessibility or Lean
-proof success. No server training result has been measured yet.
+proof success.
+
+## First pilot outcome: not accepted
+
+Epoch-zero baseline reproduced. Three capped epochs gave matched top-1
+**62→63→65→63/408**; top-5 **131→150→156→156/408**. Best checkpoint is
+epoch 2, MRR **0.27044** versus baseline **0.24433**. Paired full-val check:
+
+| Metric | Baseline | Epoch 2 | Rescued / harmed |
+|---|---:|---:|---:|
+| Matched local | 169/277 | 169/277 | 0 / 0 |
+| Matched library | 62/408 | 65/408 | 14 / 11 |
+| Matched library top-5 | 131/408 | 156/408 | 40 / 15 |
+| Teacher-forced source | 551/685 | 551/685 | 0 / 0 |
+| Oracle nonempty exact | 75/759 | 74/759 | 6 / 7 |
+| Predicted nonempty exact | 27/759 | 26/759 | 1 / 2 |
+
+Keep previous baseline. Zero-/two-/three-argument oracle outcomes are
+unchanged; one-argument exact drops **75→74/475**. Rank improvement alone
+does not justify replacing the accepted action baseline.
+
+## Next controlled ablation: original text keys
+
+Test whether frozen GRU-adapter keys constrain library identity. This is a
+hypothesis, not an established cause. `--library-key-space text` changes
+only the independent query's output width and scoring keys: project GRU
+hidden directly to the original text width (384 for current index) and
+score unit-normalized frozen text vectors. Their normalized coordinate
+scale makes an additional `1/sqrt(text_dim)` unnecessary. Original adapter
+continues supplying GRU inputs; local/source scores and frozen dual encoder
+stay unchanged. Default `adapted` mode retains the original pilot behavior.
+
+Pull updated code, then reuse the command above with:
+
+```sh
+--library-key-space text \
+--run-dir maths_ai/gnn_inference/runs/sexpr_library_identity_text_keys_pilot
+```
+
+Keep all other settings identical: three epochs, 500 library-row batches,
+learning rate 0.001, seed 42 and same candidate/epoch-zero guards. Use a new
+directory; do not resume the adapted-key run into this policy. Resume binds
+key space, and checkpoint loading requires:
+
+```python
+model.enable_library_identity(
+    key_space=checkpoint["binding"].get("library_key_space", "adapted"),
+)
+model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+```
+
+Both modes have zero correction at epoch zero. Focused checks: **28 passed**,
+including frozen-component invariance and rejecting cross-mode resume or
+in-place query replacement. Original-text-key training is pending; no new
+rank or action gain is claimed.

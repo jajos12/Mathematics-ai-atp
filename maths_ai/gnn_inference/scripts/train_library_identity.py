@@ -153,6 +153,7 @@ def main(argv=None):
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--max-train-batches", type=int, default=500)
     parser.add_argument("--k", type=int, default=200)
+    parser.add_argument("--library-key-space", choices=("adapted", "text"), default="adapted")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expected-val-library", type=int)
     parser.add_argument("--expected-val-matched", type=int)
@@ -184,7 +185,7 @@ def main(argv=None):
     config = PointerConfig.from_dict(joint["config"])
     model = JointSourceDecoder(build_pointer_model(metadata, config), text_dim=index.lemma_vectors.shape[1])
     model.load_state_dict(local["model_state_dict"], strict=True)
-    model.enable_library_identity()
+    model.enable_library_identity(key_space=args.library_key_space)
     model.requires_grad_(False)
     model.library_query.requires_grad_(True)
     model = model.to(device).eval()
@@ -223,6 +224,9 @@ def main(argv=None):
         "trained_components": "library_query_only", "source_evidence": "frozen_legacy_library_scores",
         "prefix_policy": "gold_full_index_context_no_candidate_injection",
     }
+    # Preserve first-pilot resume bindings; text-key runs get a distinct policy.
+    if args.library_key_space != "adapted":
+        binding["library_key_space"] = args.library_key_space
     root = args.run_dir
     if root.exists() and not args.resume:
         raise FileExistsError(f"library run exists: {root}; pass --resume")
@@ -232,7 +236,7 @@ def main(argv=None):
         raise ValueError("library resume uses changed data or training policy")
     _write_json(binding_path, binding)
     print(f"Library rows: train={len(indices['train'])}, val={len(indices['val'])}; "
-          f"excluded train library positions={excluded}", flush=True)
+          f"excluded train library positions={excluded}; key_space={args.library_key_space}", flush=True)
     last_path, best_path = root / "last.pt", root / "best.pt"
     epoch, phase, offset, counts = 1, "ready", 0, None
 

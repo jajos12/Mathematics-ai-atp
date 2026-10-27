@@ -1,5 +1,9 @@
 # Independent library-query probe in the joint decoder
 
+**Status: three-pilot batch closed; no whole-action replacement accepted.**
+Commands below reproduce research runs. See final comparison and decision
+at the end; the accepted offline baseline remains unchanged.
+
 ## Audit and scope
 
 Read-only full-val audit covered 4,157 states / 1,207 supported actions.
@@ -208,5 +212,43 @@ Start from the same frozen local checkpoint with a zero query, not by
 resuming either failed run. Keep three epochs, 500 batches, learning rate
 0.001 and all epoch-zero guards unchanged. Focused checks: **30 passed**,
 including exact weighted-loss SGD update, plain-CE validation equivalence,
-weighted mid-epoch resume and preservation-policy binding. This experiment
-has not run on server; baseline remains the accepted local/text decoder.
+weighted mid-epoch resume and preservation-policy binding. Server results
+and final batch decision follow.
+
+## Preservation result and closed pilot batch
+
+Preservation run reproduced epoch-zero baseline and completed three capped
+epochs. Matched top-1 **62→68→69→71/408**; top-5 **131→162→168→169/408**;
+MRR **0.24433→0.27996→0.29095→0.29355**. Selected checkpoint is epoch 3.
+Full-val paired results with final local cues:
+
+| Metric | Baseline | Preservation query | Rescued / harmed |
+|---|---:|---:|---:|
+| Matched local | 169/277 | 169/277 | 0 / 0 |
+| Matched library | 62/408 | 71/408 | 24 / 15 |
+| Matched library top-5 | 131/408 | 169/408 | 56 / 18 |
+| Teacher-forced source | 551/685 | 551/685 | 0 / 0 |
+| Oracle nonempty exact | 75/759 | 76/759 | 10 / 9 |
+| Predicted nonempty exact | 27/759 | 23/759 | 1 / 5 |
+
+Supported exact: oracle **501→502/1,207**, predicted **206→202/1,207**.
+Zero-argument oracle exact **426/448** stays fixed; one-argument **75→76/475**;
+two-/three-argument exact stays **0/203**, **0/81**. Counts alone do not show
+whether oracle rescued/harmed row sets are identical to the unweighted run.
+
+| Setting | Selected epoch | Library top-1 /408 | Top-5 /408 | Oracle nonempty /759 | Predicted nonempty /759 |
+|---|---:|---:|---:|---:|---:|
+| Accepted baseline | — | 62 | 131 | 75 | **27** |
+| Adapted keys | 2 | 65 | 156 | 74 | 26 |
+| Original text keys | 2 | **72** | 159 | **76** | 25 |
+| Text keys, preservation weight 2.25 | 3 | 71 | **169** | **76** | 23 |
+
+**No candidate accepted. This three-pilot batch is closed.** Retain the
+existing local/text offline baseline. All library-query components remain
+opt-in, and research checkpoints are retained without replacing inference
+defaults. Ranking gains did not translate into better predicted complete
+actions; the preservation objective did not reduce observed harms. These
+small capped pilots do not establish that all contextual library scoring
+will fail. Global lemma identity and action-level generalization remain
+open; no further loss/scale tuning is queued on this same small val cohort.
+No Lean proof-success gain was measured.

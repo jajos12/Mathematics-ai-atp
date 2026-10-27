@@ -106,13 +106,15 @@ def test_missing_gold_has_no_identity_loss_and_unsupported_rows_are_excluded():
         SimpleNamespace(id_to_position={999: 0}, lemma_vectors=np.eye(4, dtype=np.float32)[:1]),
         device=torch.device("cpu"), epoch=1, split="train", k=2,
         optimizer=torch.optim.AdamW(model.library_query.parameters()),
+        text_top1_weight=2.25,
     )
     assert metrics["missing_library_positions"] == 1
     assert metrics["mean_library_loss"] == 0
     torch.testing.assert_close(before, model.library_query.weight, rtol=0, atol=0)
 
 
-def test_mid_epoch_resume_matches_uninterrupted_query_training():
+@pytest.mark.parametrize("text_top1_weight", [1.0, 2.25])
+def test_mid_epoch_resume_matches_uninterrupted_query_training(text_top1_weight):
     torch.manual_seed(217)
     graphs = [_graph(i, [-1], [100 if i % 2 else 101], split="train") for i in range(51)]
     sampler = GraphBudgetBatchSampler([(3, 2)] * len(graphs), max_graphs=1,
@@ -133,7 +135,7 @@ def test_mid_epoch_resume_matches_uninterrupted_query_training():
     model, optimizer = initialize()
     expected = runner._run_epoch(model, loader, sampler, _provider(), index,
                                 device=torch.device("cpu"), epoch=1, split="train",
-                                k=2, optimizer=optimizer)
+                                k=2, optimizer=optimizer, text_top1_weight=text_top1_weight)
     expected_state = deepcopy(model.state_dict())
     model, optimizer = initialize()
     checkpoint = {}
@@ -146,7 +148,8 @@ def test_mid_epoch_resume_matches_uninterrupted_query_training():
     with pytest.raises(InterruptedError):
         runner._run_epoch(model, loader, sampler, _provider(), index,
                           device=torch.device("cpu"), epoch=1, split="train",
-                          k=2, optimizer=optimizer, on_progress=interrupt)
+                          k=2, optimizer=optimizer, on_progress=interrupt,
+                          text_top1_weight=text_top1_weight)
     restored, restored_optimizer = initialize()
     restored.load_state_dict(checkpoint["model"], strict=True)
     restored_optimizer.load_state_dict(checkpoint["optimizer"])
@@ -154,10 +157,60 @@ def test_mid_epoch_resume_matches_uninterrupted_query_training():
         restored, loader, sampler, _provider(), index, device=torch.device("cpu"),
         epoch=1, split="train", k=2, optimizer=restored_optimizer,
         start_batch=checkpoint["next_batch"], initial_counts=checkpoint["counts"],
+        text_top1_weight=text_top1_weight,
     )
     assert actual == expected
     for key, value in expected_state.items():
         torch.testing.assert_close(value, restored.state_dict()[key], rtol=0, atol=0)
+
+
+def test_text_top1_weight_uses_normalized_training_loss_but_reports_plain_ce():
+    torch.manual_seed(218)
+    graphs = [_graph(7, [-1], [100]), _graph(9, [-1], [101])]
+    sampler = GraphBudgetBatchSampler([(3, 2)] * 2, max_graphs=2)
+    loader = DataLoader(graphs, batch_sampler=sampler)
+    provider = _provider()
+    initial = _model().state_dict()
+
+    def initialize():
+        model = _model()
+        model.load_state_dict(initial, strict=True)
+        model.enable_library_identity(key_space="text")
+        model.requires_grad_(False)
+        model.library_query.requires_grad_(True)
+        return model.eval(), torch.optim.SGD(model.library_query.parameters(), lr=0.01)
+
+    reference, reference_optimizer = initialize()
+    batch = next(iter(loader))
+    nodes = reference.pointer.backbone.encode_nodes(batch)
+    states = reference.pointer.backbone.readout(nodes, batch)
+    pools = runner.candidate_groups_from_batch(batch, nodes, *provider.search(batch, k=2))
+    losses = []
+    for row, pool in enumerate(pools):
+        hidden = reference.initial_state(states[row], int(batch.y[row]))
+        _, _, logits = reference.score_step(hidden, pool)
+        losses.append(torch.nn.functional.cross_entropy(logits.view(1, -1), torch.tensor([row])))
+    expected_plain_loss = float(torch.stack(losses).mean().detach())
+    expected_objective = (2.25 * losses[0] + losses[1]) / 3.25
+    expected_objective.backward()
+    torch.nn.utils.clip_grad_norm_(reference.library_query.parameters(), 1.0)
+    reference_optimizer.step()
+
+    actual, optimizer = initialize()
+    metrics = runner._run_epoch(
+        actual, loader, sampler, provider, None, device=torch.device("cpu"),
+        epoch=1, split="train", k=2, optimizer=optimizer, text_top1_weight=2.25,
+    )
+    assert metrics["mean_library_loss"] == pytest.approx(expected_plain_loss)
+    for key, value in reference.state_dict().items():
+        torch.testing.assert_close(value, actual.state_dict()[key], rtol=0, atol=0)
+    # Validation ignores optimization weights and remains comparable to prior runs.
+    unweighted = runner._run_epoch(actual, loader, sampler, provider, None,
+                                  device=torch.device("cpu"), epoch=1, split="val", k=2)
+    weighted = runner._run_epoch(actual, loader, sampler, provider, None,
+                                device=torch.device("cpu"), epoch=1, split="val", k=2,
+                                text_top1_weight=2.25)
+    assert weighted == unweighted
 
 
 def test_runner_preserves_epoch_zero_and_resume_binding(tmp_path, monkeypatch):
@@ -248,11 +301,20 @@ def test_runner_preserves_epoch_zero_and_resume_binding(tmp_path, monkeypatch):
         runner.main([*argv, "--expected-val-matched", "9", "--resume"])
     with pytest.raises(ValueError, match="changed data or training policy"):
         runner.main([*argv, "--library-key-space", "text", "--resume"])
+    with pytest.raises(ValueError, match="changed data or training policy"):
+        runner.main([*argv, "--text-top1-weight", "2.25", "--resume"])
+    with pytest.raises(ValueError, match="text top1 weight"):
+        runner.main([*argv, "--text-top1-weight", "0.5"])
     text_run = tmp_path / "text_run"
     assert runner.main([*argv, "--run-dir", str(text_run), "--library-key-space", "text"]) == 0
     text_saved = torch.load(text_run / "last.pt", map_location="cpu", weights_only=False)
     assert text_saved["binding"]["library_key_space"] == "text"
     assert text_saved["model_state_dict"]["library_query.weight"].shape == (4, 8)
+    preserve_run = tmp_path / "preserve_run"
+    assert runner.main([*argv, "--run-dir", str(preserve_run), "--library-key-space", "text",
+                        "--text-top1-weight", "2.25"]) == 0
+    preserve_saved = torch.load(preserve_run / "last.pt", map_location="cpu", weights_only=False)
+    assert preserve_saved["binding"]["text_top1_weight"] == 2.25
     paths["node_vocab_sha256"].write_text('{"different": 1}')
     # Snapshot manifest is bound, not recomputed from changed sources.
     previous_provider = Provider.__init__

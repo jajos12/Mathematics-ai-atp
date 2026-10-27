@@ -151,7 +151,62 @@ model.enable_library_identity(
 model.load_state_dict(checkpoint["model_state_dict"], strict=True)
 ```
 
-Both modes have zero correction at epoch zero. Focused checks: **28 passed**,
-including frozen-component invariance and rejecting cross-mode resume or
-in-place query replacement. Original-text-key training is pending; no new
-rank or action gain is claimed.
+Both modes have zero correction at epoch zero. Focused checks at text-key
+introduction: **28 passed**, including frozen-component invariance and
+rejecting cross-mode resume or in-place query replacement. Results follow.
+
+## Text-key result and action-relevant audit
+
+Text-key epoch 2 improves matched library **62→72/408** (24 rescued,
+14 harmed), top-5 **131→159/408**, MRR **0.24433→0.29418**. But paired
+nonempty actions are oracle **75→76/759** (10/9), predicted **27→25/759**
+(1/3). Local **169/277** and source **551/685** remain unchanged. Keep
+previous baseline; text-key query is not accepted for end-to-end replacement.
+
+A fixed-checkpoint audit of the same 500 epoch-2 training batches found:
+
+| First-library cohort | Train baseline → query | Val baseline → query |
+|---|---:|---:|
+| Gold first lemma retrieved | 1,891→2,831/12,036 | 65→81/387 |
+| One-reference action, gold retrieved | 1,162→1,759/7,212 | 41→45/222 |
+| One reference, count/source correct | 860→1,321/5,590 | 29→30/167 |
+| One reference, tactic/count/source correct | 342→535/2,079 | 11→9/42 |
+
+Last row has **282 rescues / 89 harms train**, **1 / 3 val**. Training
+sample was seen during fitting, not held out. All four training margin
+quartiles improve; training `rw` **195→310/1,362**, val `rw` **9→6/29**.
+Do not choose a confidence cutoff or disable `rw` from those val losses.
+Baseline-correct choices lost: **89/342 (26.0%) train**, **3/11 (27.3%) val**;
+baseline-wrong rescued: **282/1,737 (16.2%) train**, **1/31 (3.2%) val**.
+This small val cohort does not establish the cause of weak generalization.
+
+## Train-only preservation-weight experiment
+
+Keep text-key architecture, frozen components and candidate policy fixed.
+`--text-top1-weight 2.25` upweights CE when frozen text already ranks gold
+first, across all retrieved train library targets. Weight is fixed from
+the training action-ready class ratio: `sqrt((2079 - 342) / 342) = 2.25365`,
+rounded to 2.25. It is a training-derived preservation hypothesis, not a
+val-selected threshold or serving-time eligibility mask. The audited
+baseline includes the legacy residual; actual weight trigger is the frozen
+text top-1 itself, not the diagnostic action-ready mask.
+
+Optimize `sum(weight * CE) / sum(weight)` per batch. Reported
+`mean_library_loss` remains plain CE and validation ranking is unweighted,
+so results remain comparable. Default weight 1 preserves prior behavior;
+non-default weight is resume-bound. No model parameters or forward scoring
+change, and missing gold still gets no identity loss.
+
+Reuse the text-key pilot command with a **new directory** and:
+
+```sh
+--text-top1-weight 2.25 \
+--run-dir maths_ai/gnn_inference/runs/sexpr_library_identity_text_preserve_pilot
+```
+
+Start from the same frozen local checkpoint with a zero query, not by
+resuming either failed run. Keep three epochs, 500 batches, learning rate
+0.001 and all epoch-zero guards unchanged. Focused checks: **30 passed**,
+including exact weighted-loss SGD update, plain-CE validation equivalence,
+weighted mid-epoch resume and preservation-policy binding. This experiment
+has not run on server; baseline remains the accepted local/text decoder.

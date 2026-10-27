@@ -51,7 +51,9 @@ def _metrics(totals, split):
 
 def _run_epoch(model, loader, sampler, provider, index, *, device, epoch, split,
                k, optimizer=None, max_batches=0, start_batch=0,
-               initial_counts=None, on_progress=None):
+               initial_counts=None, on_progress=None, text_top1_weight=1.0):
+    if not math.isfinite(text_top1_weight) or text_top1_weight < 1:
+        raise ValueError("text top1 weight must be finite and at least one")
     model.eval()  # All frozen dropout stays off, including during query training.
     sampler.set_epoch(epoch)
     totals = Counter(initial_counts or {})
@@ -70,7 +72,7 @@ def _run_epoch(model, loader, sampler, provider, index, *, device, epoch, split,
         pools = candidate_groups_from_batch(batch, nodes, ids, vectors, scores)
         if training:
             optimizer.zero_grad(set_to_none=True)
-        losses = []
+        losses, loss_weights = [], []
         with torch.set_grad_enabled(training), torch.amp.autocast(
                 device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             for row, (pool, gold) in enumerate(zip(pools, gold_arguments_from_batch(batch))):
@@ -93,6 +95,8 @@ def _run_epoch(model, loader, sampler, provider, index, *, device, epoch, split,
                             _, _, logits = model.score_step(hidden, pool, adapted=adapted, step=step)
                             target = torch.tensor([position], device=device)
                             losses.append(F.cross_entropy(logits.float().view(1, -1), target))
+                            text_correct = pool.lemma_scores.argmax().item() == position
+                            loss_weights.append(text_top1_weight if text_correct else 1.0)
                             # Stable order breaks ties consistently with argmax.
                             order = torch.argsort(logits, descending=True, stable=True)
                             rank = int((order == position).nonzero(as_tuple=False)[0, 0]) + 1
@@ -101,9 +105,7 @@ def _run_epoch(model, loader, sampler, provider, index, *, device, epoch, split,
                                 totals[f"{cohort}_top1_sum"] += int(rank == 1)
                                 totals[f"{cohort}_top5_sum"] += int(rank <= 5)
                                 totals[f"{cohort}_mrr_sum"] += 1.0 / rank
-                                totals[f"{cohort}_text_top1_sum"] += int(
-                                    pool.lemma_scores.argmax().item() == position
-                                )
+                                totals[f"{cohort}_text_top1_sum"] += int(text_correct)
                             totals[f"slot_{step + 1}_retrieved_positions"] += 1
                             totals[f"slot_{step + 1}_top1"] += int(rank == 1)
                         # Missing gold supplies context only, never a selectable key.
@@ -125,7 +127,12 @@ def _run_epoch(model, loader, sampler, provider, index, *, device, epoch, split,
                     with torch.no_grad():
                         hidden = model.pointer.argument_selector.gru(next_vector, hidden)
             if losses:
-                loss = torch.stack(losses).mean()
+                individual = torch.stack(losses)
+                if training and text_top1_weight != 1.0:
+                    weights = individual.new_tensor(loss_weights)
+                    loss = (individual * weights).sum() / weights.sum()
+                else:
+                    loss = individual.mean()
                 if not bool(torch.isfinite(loss).item()):
                     raise RuntimeError(f"nonfinite library identity loss at batch {batch_number}")
                 if training:
@@ -154,6 +161,8 @@ def main(argv=None):
     parser.add_argument("--max-train-batches", type=int, default=500)
     parser.add_argument("--k", type=int, default=200)
     parser.add_argument("--library-key-space", choices=("adapted", "text"), default="adapted")
+    parser.add_argument("--text-top1-weight", type=float, default=1.0,
+                        help="train-only CE weight when frozen text ranks gold first; default 1 preserves pilot")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expected-val-library", type=int)
     parser.add_argument("--expected-val-matched", type=int)
@@ -161,8 +170,9 @@ def main(argv=None):
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     if (min(args.epochs, args.batch_size, args.k) < 1 or args.max_train_batches < 0
-            or not math.isfinite(args.learning_rate) or args.learning_rate <= 0):
-        raise ValueError("invalid epochs, batch size, k, batch cap or learning rate")
+            or not math.isfinite(args.learning_rate) or args.learning_rate <= 0
+            or not math.isfinite(args.text_top1_weight) or args.text_top1_weight < 1):
+        raise ValueError("invalid epochs, batch size, k, batch cap, learning rate or text top1 weight")
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     joint = torch.load(args.joint_checkpoint, map_location="cpu", weights_only=False)
@@ -227,6 +237,8 @@ def main(argv=None):
     # Preserve first-pilot resume bindings; text-key runs get a distinct policy.
     if args.library_key_space != "adapted":
         binding["library_key_space"] = args.library_key_space
+    if args.text_top1_weight != 1.0:
+        binding["text_top1_weight"] = args.text_top1_weight
     root = args.run_dir
     if root.exists() and not args.resume:
         raise FileExistsError(f"library run exists: {root}; pass --resume")
@@ -236,7 +248,8 @@ def main(argv=None):
         raise ValueError("library resume uses changed data or training policy")
     _write_json(binding_path, binding)
     print(f"Library rows: train={len(indices['train'])}, val={len(indices['val'])}; "
-          f"excluded train library positions={excluded}; key_space={args.library_key_space}", flush=True)
+          f"excluded train library positions={excluded}; key_space={args.library_key_space}; "
+          f"text_top1_weight={args.text_top1_weight}", flush=True)
     last_path, best_path = root / "last.pt", root / "best.pt"
     epoch, phase, offset, counts = 1, "ready", 0, None
 
@@ -298,6 +311,7 @@ def main(argv=None):
                 model, *loaders["train"], provider, index, device=device, epoch=epoch, split="train",
                 k=args.k, optimizer=optimizer, max_batches=args.max_train_batches,
                 start_batch=offset, initial_counts=counts,
+                text_top1_weight=args.text_top1_weight,
                 on_progress=lambda next_batch, totals: save("training", next_batch=next_batch, train_counts=totals),
             )
             print(f"epoch {epoch} train: {json.dumps(train)}", flush=True)

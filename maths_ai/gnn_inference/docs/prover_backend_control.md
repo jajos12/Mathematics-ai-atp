@@ -96,11 +96,11 @@ and 120 seconds by default; the actual toolchain is reported.
 Local corrected control: seeds **0 and 1 compile**, seed **2 hits output cap**
 with an unterminated final proof block. All three match 193 input tokens.
 This means **2/3 samples on one known example**, not 2/3 theorem solve rate.
-Reference server results remain pending; no quantization-only conclusion.
+Reference results and their limitations follow below.
 Verification: **32 focused diagnostic/joint/local tests pass**, including
 reference full-precision loader/sampling contracts, tokenizer text fidelity,
 single-BOS handling, immutable target/axiom checks, operational timeout and
-resume-policy rejection. Native full-model execution still needs the server.
+resume-policy rejection. The reference subsequently executed on the server.
 
 Compare report contracts after both runs:
 
@@ -113,3 +113,39 @@ Different tokenizer/prompt/settings hashes fail comparison. Backend stacks,
 sampling implementations and precision differ, so even a successful matched
 contract is not an isolated quantization ablation. Proof validity must use
 the same Lean environment; generation-only reports explicitly say unchecked.
+
+## Official BF16 reference result
+
+Server loaded the pinned official weights on one RTX 3090 in BF16, reporting
+only `torch.bfloat16` parameters. Runtime: PyTorch **2.7.1+cu118**, Transformers
+**5.18.0**, tokenizers **0.23.2**, Accelerate **1.15.0**. First load took
+**583.11 s**, including the one-time ~13.8 GB download and weight loading;
+this is not per-proof generation latency.
+
+Three unique seeds all report **193 input tokens**. Generation times:
+**31.30 / 26.27 / 26.52 s**, output lengths **1,024 / 996 / 999** tokens.
+Seed 0 ends at the cap before a completed final proof. Seeds 1 and 2 contain
+complete candidates. Their exact final proof blocks, pasted by the user,
+were rechecked locally with the same fixed-target validator, full
+Mathlib/Aesop and Lean **4.29.1**: both compiler exit 0, standard allowed
+axioms, no `sorryAx`. Check times **49.53 / 5.16 s**. Pasted duplicate seed-0
+log text is not counted as another sample. Full server report/hash manifest
+has not been imported, so the automated comparison-key check remains pending.
+
+| Backend | Seed 0 | Seed 1 | Seed 2 | Verified complete samples |
+|---|---|---|---|---:|
+| Local Q4_K_M Ollama | Pass | Pass | Output cap | 2/3 |
+| Official BF16 Transformers | Output cap | Pass | Pass | 2/3 |
+
+This single known example shows both paths can produce checked proofs under
+fresh formal-completion conditions. It does **not** establish equal model
+quality, isolate quantization effects, or explain the user's degenerate
+interactive response. The control explicitly requests a proof plan, so prose
+here is expected and is not a code-only instruction-following test. Seed
+matching is not token-sequence matching across different samplers.
+
+The server's final `lean_passed: 0` was generation-only (`not_requested`),
+not three rejected proofs. Deprecation warnings did not prevent inference.
+Future work should separate output-budget truncation from proof errors and
+use a fixed small task set before agent-quality claims. Keep this compatibility
+control distinct from source-native replay and theorem-solving benchmarks.

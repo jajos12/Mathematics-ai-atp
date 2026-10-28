@@ -70,4 +70,31 @@ No training, retrieval, source-native evaluation or agent-search claim.
 compilation of trusted reference proofs for all ten tasks, extra-assumption
 rejection and equivalent-binder acceptance. Reference proofs live only in
 tests; the runtime task manifest contains statements and categories only.
-Full ten-task model inference has not run yet.
+
+## First server result
+
+Cached BF16 model loaded once in **72.11 s**. All ten tasks completed using
+**12 generation requests**, with no hidden retries:
+
+| Measure | Result |
+|---|---:|
+| Model first try | 8/10 |
+| Model with at most one repair | 9/10 |
+| Fixed automation portfolio | 9/10 |
+| Model-only solved | 1 |
+| Automation-only solved | 1 |
+| Post-hoc union of verified results | 10/10 |
+
+Model `nat_cancel` was Lean-rejected on both attempts. `set_distrib` hit the
+2,048-token cap first, then passed its feedback retry. That retry recovered
+truncation, not a demonstrated mathematical compiler-error correction.
+Other eight tasks passed first try. Baseline-only task must be `nat_cancel`;
+the model-only task identity and automation diagnostic need the detailed
+report and must not be guessed from aggregate counts.
+
+Both systems solve nine tasks but different ones. Their union is observed
+coverage, **not a separately executed automation-first combined policy**.
+No general 90% theorem-solving claim or superiority over automation follows.
+This smoke establishes usable proof-completion/validation plumbing beyond
+the single published example. Next inspect the failed cancellation proofs
+and model-only case before changing prompts, training or orchestration.

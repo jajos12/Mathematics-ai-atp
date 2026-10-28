@@ -105,17 +105,14 @@ def _lean_context(project):
     return project, toolchain, result.stdout.strip()
 
 
-def _validate(raw, context, timeout):
-    try:
-        body = _extract_body(raw)
-    except ValueError as error:
-        return {"status": "no_complete_body", "error": str(error)}
+def _check_source(code, theorem_name, context, timeout):
+    """Compile host-constructed source and audit one frozen target theorem."""
     project, toolchain, lean_path = context
     env = {**os.environ, "LEAN_PATH": lean_path}
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="lean-backend-control-") as directory:
         source = Path(directory) / "Candidate.lean"
-        source.write_text(_lean_source(body), encoding="utf-8")
+        source.write_text(code, encoding="utf-8")
         try:
             result = subprocess.run(["elan", "run", toolchain, "lean", str(source)],
                                     cwd=project, env=env, capture_output=True,
@@ -123,17 +120,24 @@ def _validate(raw, context, timeout):
         except subprocess.TimeoutExpired:
             return {"status": "validator_timeout", "seconds": round(time.monotonic() - started, 3)}
     output = result.stdout + result.stderr
-    pattern = r"^'" + re.escape(THEOREM) + r"' depends on axioms:\s*\[([^\]]*)\]"
+    pattern = r"^'" + re.escape(theorem_name) + r"' depends on axioms:\s*\[([^\]]*)\]"
     match = re.search(pattern, output, re.MULTILINE)
-    no_axioms = re.search(r"^'" + re.escape(THEOREM) + r"' does not depend on any axioms$",
+    no_axioms = re.search(r"^'" + re.escape(theorem_name) + r"' does not depend on any axioms$",
                           output, re.MULTILINE) is not None
     axioms = [item.strip() for item in match.group(1).split(",") if item.strip()] if match else []
     passed = (result.returncode == 0 and (bool(match) or no_axioms)
               and set(axioms) <= ALLOWED_AXIOMS and "sorryAx" not in output)
     return {"status": "passed" if passed else "lean_rejected", "toolchain": toolchain,
             "exit_code": result.returncode, "axioms": axioms,
-            "seconds": round(time.monotonic() - started, 3),
-            "proof_body": body, "diagnostics": output}
+            "seconds": round(time.monotonic() - started, 3), "diagnostics": output}
+
+
+def _validate(raw, context, timeout):
+    try:
+        body = _extract_body(raw)
+    except ValueError as error:
+        return {"status": "no_complete_body", "error": str(error)}
+    return {**_check_source(_lean_source(body), THEOREM, context, timeout), "proof_body": body}
 
 
 def _runtime():
@@ -218,50 +222,79 @@ def _ollama(args, prompt, expected_tokens, seed):
             "generation_seconds": data.get("eval_duration", 0) / 1e9}
 
 
-def _reference(args, tokenizer, input_ids, seeds):
-    import torch
-    from transformers import AutoModelForCausalLM, GenerationConfig, set_seed
-    started = time.monotonic()
-    model = AutoModelForCausalLM.from_pretrained(
-        REFERENCE, revision=REVISION, cache_dir=args.hf_cache,
-        torch_dtype=getattr(torch, args.dtype), device_map={"": args.device},
-        attn_implementation="sdpa", trust_remote_code=False,
-    ).eval()
-    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
-        raise RuntimeError("Reference model must not be quantized")
-    if any(p.device.type != "cuda" for p in model.parameters()):
-        raise RuntimeError("Reference model unexpectedly offloaded")
-    print(json.dumps({"reference_load_seconds": round(time.monotonic() - started, 3),
-                      "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()})}), flush=True)
-    inputs = torch.tensor([input_ids], device=args.device)
-    generation = GenerationConfig(
-        do_sample=True, num_beams=1, max_new_tokens=args.max_new_tokens,
-        temperature=0.6, top_p=0.95, top_k=50, min_p=0.0,
-        repetition_penalty=1.0, no_repeat_ngram_size=0,
-        eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id, use_cache=True,
-    )
-    try:
-        for seed in seeds:
-            set_seed(seed)
-            torch.cuda.synchronize(args.device)
-            started = time.monotonic()
-            with torch.inference_mode():
-                output = model.generate(input_ids=inputs, attention_mask=torch.ones_like(inputs),
-                                        generation_config=generation, max_time=args.request_timeout)
-            torch.cuda.synchronize(args.device)
-            tokens = output[0, len(input_ids):].tolist()
-            ended = bool(tokens) and tokens[-1] == tokenizer.eos_token_id
-            yield {"seed": seed, "status": "generated",
-                   "raw_text": tokenizer.decode(tokens, skip_special_tokens=True),
-                   "wall_seconds": round(time.monotonic() - started, 3),
-                   "input_tokens": len(input_ids), "input_token_count_matches": True,
-                   "output_tokens": len(tokens),
-                   "done_reason": "stop" if ended else "length" if len(tokens) >= args.max_new_tokens else "time_limit"}
-    finally:
-        del model
+class ReferenceGenerator:
+    """One frozen reference load, reusable across independent prompts/tasks."""
+
+    def __init__(self, args, tokenizer):
+        self.args, self.tokenizer, self.model = args, tokenizer, None
+
+    def __enter__(self):
+        import torch
+        from packaging.version import Version
+        from transformers import AutoModelForCausalLM
+        started = time.monotonic()
+        precision_key = ("dtype" if Version(importlib.metadata.version("transformers")) >= Version("4.56")
+                         else "torch_dtype")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            REFERENCE, revision=REVISION, cache_dir=self.args.hf_cache,
+            **{precision_key: getattr(torch, self.args.dtype)}, device_map={"": self.args.device},
+            attn_implementation="sdpa", trust_remote_code=False,
+            local_files_only=getattr(self.args, "local_files_only", False),
+        ).eval()
+        try:
+            if getattr(self.model, "is_loaded_in_4bit", False) or getattr(self.model, "is_loaded_in_8bit", False):
+                raise RuntimeError("Reference model must not be quantized")
+            if any(p.device.type != "cuda" for p in self.model.parameters()):
+                raise RuntimeError("Reference model unexpectedly offloaded")
+        except Exception:
+            self.close()
+            raise
+        print(json.dumps({"reference_load_seconds": round(time.monotonic() - started, 3),
+                          "parameter_dtypes": sorted({str(p.dtype) for p in self.model.parameters()})}), flush=True)
+        return self
+
+    def generate(self, input_ids, seed):
+        import torch
+        from transformers import GenerationConfig, set_seed
+        args, tokenizer = self.args, self.tokenizer
+        inputs = torch.tensor([input_ids], device=args.device)
+        generation = GenerationConfig(
+            do_sample=True, num_beams=1, max_new_tokens=args.max_new_tokens,
+            temperature=0.6, top_p=0.95, top_k=50, min_p=0.0,
+            repetition_penalty=1.0, no_repeat_ngram_size=0,
+            eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id, use_cache=True, max_time=args.request_timeout,
+        )
+        set_seed(seed)
+        torch.cuda.synchronize(args.device)
+        started = time.monotonic()
+        with torch.inference_mode():
+            output = self.model.generate(input_ids=inputs, attention_mask=torch.ones_like(inputs),
+                                         generation_config=generation)
+        torch.cuda.synchronize(args.device)
+        tokens = output[0, len(input_ids):].tolist()
+        ended = bool(tokens) and tokens[-1] == tokenizer.eos_token_id
+        return {"seed": seed, "status": "generated",
+                "raw_text": tokenizer.decode(tokens, skip_special_tokens=True),
+                "wall_seconds": round(time.monotonic() - started, 3),
+                "input_tokens": len(input_ids), "input_token_count_matches": True,
+                "output_tokens": len(tokens),
+                "done_reason": "stop" if ended else "length" if len(tokens) >= args.max_new_tokens else "time_limit"}
+
+    def close(self):
+        import torch
+        self.model = None
         gc.collect()
         torch.cuda.empty_cache()
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def _reference(args, tokenizer, input_ids, seeds):
+    with ReferenceGenerator(args, tokenizer) as model:
+        for seed in seeds:
+            yield model.generate(input_ids, seed)
 
 
 def _compare(paths):

@@ -255,10 +255,11 @@ def test_reference_requests_full_precision_and_explicit_sampling(monkeypatch):
     assert seeded == [0, 1]
     kwargs = loaded[0][1]
     assert kwargs["revision"] == runner.REVISION
-    assert kwargs["torch_dtype"] == torch.bfloat16
+    assert kwargs.get("dtype", kwargs.get("torch_dtype")) == torch.bfloat16
     assert kwargs["device_map"] == {"": "cuda:0"}
     assert "quantization_config" not in kwargs and "load_in_4bit" not in kwargs
     config = sampled[0]["generation_config"]
     assert (config.temperature, config.top_p, config.top_k, config.repetition_penalty) == (0.6, 0.95, 50, 1.0)
     assert config.max_new_tokens == 1024 and config.num_beams == 1
+    assert config.max_time == 300 and "max_time" not in sampled[0]
     assert [row["done_reason"] for row in results] == ["stop", "stop"]

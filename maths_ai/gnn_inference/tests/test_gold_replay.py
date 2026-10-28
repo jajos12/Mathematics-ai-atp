@@ -216,6 +216,13 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
                        target_state="no goals", file_path="A.lean", repo_commit=runner.DATASET_MATHLIB_COMMIT),
             DatasetRow("h : P\n⊢ P", "T", "simp only [h]", "val", 2,
                        target_state="no goals", file_path="A.lean", repo_commit=runner.DATASET_MATHLIB_COMMIT)]
+
+    def syntax_node(kind, *children):
+        return {"tag": "node", "kind": kind, "children": list(children)}
+
+    def syntax_atom(value):
+        return {"tag": "atom", "source": value}
+
     for row in rows:
         raw = {"schema_version": SExprCache.SCHEMA_VERSION,
                "extractor_version": SExprCache.EXTRACTOR_VERSION,
@@ -231,15 +238,22 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
             "normalization": ModelSExprCache.NORMALIZATION,
             "raw_record_sha256": ModelSExprCache.raw_record_sha256(raw),
         })
+        identifier = {"tag": "identifier", "source": "h", "semanticRole": "local", "contextIndex": 0}
+        syntax = syntax_node("Lean.Parser.Tactic.exact", identifier)
+        if row.row_index == 2:
+            syntax = syntax_node(
+                "Lean.Parser.Tactic.simp", syntax_atom("simp"), syntax_node("null"), syntax_node("null"),
+                syntax_node("null", syntax_atom("only")),
+                syntax_node("null", syntax_atom("["), syntax_node("null", syntax_node(
+                    "Lean.Parser.Tactic.simpLemma", syntax_node("null"), syntax_node("null"), identifier,
+                )), syntax_atom("]")), syntax_node("null"),
+            )
+        syntax.update(sourceStart=1, sourceEnd=8)
         trace_cache.save("val", row.row_index, {
             "schema_version": SourceSyntaxTraceCache.SCHEMA_VERSION,
             "extractor_version": SourceSyntaxTraceCache.EXTRACTOR_VERSION,
             "raw_record_sha256": SourceSyntaxTraceCache.raw_record_sha256(raw),
-            "local_context": _context(), "source_syntax": {
-                "tag": "node", "sourceStart": 1, "sourceEnd": 8, "children": [
-                    {"tag": "identifier", "source": "h", "semanticRole": "local", "contextIndex": 0},
-                ],
-            },
+            "local_context": _context(), "syntax_args": [], "source_syntax": syntax,
         })
     calls = []
 
@@ -270,6 +284,18 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
     assert len(calls) == 1
     with pytest.raises(ValueError, match="resume bindings changed"):
         runner.main([*argv, "--seed", "43", "--resume"])
+    with pytest.raises(ValueError, match="resume bindings changed"):
+        runner.main([*argv, "--renderer", "template-v1", "--resume"])
+    template_output = tmp_path / "template_output"
+    assert runner.main([*argv, "--output-dir", str(template_output), "--renderer", "template-v1"]) == 0
+    templates = json.loads((template_output / "report.json").read_text())
+    assert templates["manifest"]["template_schema"] == "rw_simp_template_v1"
+    assert templates["summary"]["flat_renderable_steps"] == 1
+    assert templates["summary"]["template_v1_parsed_steps"] == 1
+    assert templates["summary"]["newly_renderable_vs_flat"] == 1
+    assert templates["summary"]["rendered_transition_match"] == 2
+    typed = templates["files"]["A.lean"]["rows"][1]["template_target"]
+    assert typed["only"] is True and typed["rule_count"] == 1
 
     def fail_native(*args, **kwargs):
         raise RuntimeError("backend failed")

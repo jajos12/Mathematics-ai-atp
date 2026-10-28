@@ -81,6 +81,16 @@ def render_flat_action(tactic: str, references: list[FlatReference],
     _, reason = flat_reference_syntax(tactic + (" x" if references else ""))
     if reason != "supported":
         raise RenderError(reason)
+    arguments = resolve_references(references, local_context)
+    if not arguments:
+        return tactic
+    if tactic in _LIST_TACTICS:
+        return f"{tactic} [{', '.join(arguments)}]"
+    return f"{tactic} {' '.join(arguments)}"
+
+
+def resolve_references(references: list[FlatReference], local_context: list[dict]) -> list[str]:
+    """Resolve typed references without imposing a tactic's syntax or arity."""
     entries = {}
     for item in local_context:
         index = item.get("contextIndex", item.get("context_index"))
@@ -104,11 +114,7 @@ def render_flat_action(tactic: str, references: list[FlatReference],
             arguments.append(_quoted_name(name))
         else:
             raise RenderError("unresolved reference")
-    if not arguments:
-        return tactic
-    if tactic in _LIST_TACTICS:
-        return f"{tactic} [{', '.join(arguments)}]"
-    return f"{tactic} {' '.join(arguments)}"
+    return arguments
 
 
 def render_trace_action(raw_tactic: str, trace: dict, *, max_args: int = 3) -> str:
@@ -256,6 +262,10 @@ def summarize_replays(rows: list[dict]) -> dict:
     return {
         "selected_steps": len(rows), "status_counts": dict(Counter(r["status"] for r in rows)),
         "renderable_steps": sum(isinstance(r.get("rendered_tactic"), str) for r in rows),
+        "flat_renderable_steps": sum(bool(r.get("flat_renderable")) for r in rows),
+        "template_v1_parsed_steps": sum(r.get("template_target") is not None for r in rows),
+        "newly_renderable_vs_flat": sum(isinstance(r.get("rendered_tactic"), str)
+                                        and r.get("flat_renderable") is False for r in rows),
         **{name: sum(bool(r.get(name)) for r in rows) for name in (
             "input_model_match", "original_executed", "original_transition_match",
             "rendered_executed", "rendered_transition_match",

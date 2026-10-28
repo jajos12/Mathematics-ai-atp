@@ -16,12 +16,13 @@ from pathlib import Path
 from maths_ai.gnn_inference.atp_lean_gnn.bundle import file_sha256
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DATASET_NAME, iter_dataset_rows
 from maths_ai.gnn_inference.atp_lean_gnn.gold_replay import (
-    LEAN_HELPER, RenderError, assess_replay, render_trace_action, run_native_file,
+    LEAN_HELPER, assess_replay, run_native_file,
     select_theorems, summarize_replays,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.preparation import ModelSExprCache, SExprCache, SourceSyntaxTraceCache
 from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import DATASET_MATHLIB_COMMIT, PANTOGRAPH_COMMIT
 from maths_ai.gnn_inference.scripts.setup_sexpr_environment import LEAN_TOOLCHAIN
+from maths_ai.gnn_inference.atp_lean_gnn import tactic_templates
 
 
 def _git(root, *args):
@@ -47,7 +48,7 @@ def _write_report(path, report):
     temporary.replace(path)
 
 
-def _prepare_row(row, cache_root, raw_cache, model_cache, trace_cache):
+def _prepare_row(row, cache_root, raw_cache, model_cache, trace_cache, *, renderer="flat"):
     payload = {"row_index": row.row_index, "theorem": row.theorem, "file_path": row.file_path,
                "tactic": row.tactic, "rendered_tactic": None, "cache_hashes": {}}
     for directory in ("sexpr", "model_sexpr_v2", "action_trace_v3"):
@@ -70,12 +71,7 @@ def _prepare_row(row, cache_root, raw_cache, model_cache, trace_cache):
         unit, invocation = raw["unit_index"], raw["invocation_index"]
         if any(type(i) is not int or i < 0 for i in (unit, invocation)):
             raise ValueError("invalid source invocation coordinates")
-        try:
-            payload["rendered_tactic"] = render_trace_action(row.tactic, trace)
-            render_error = None
-        except (RenderError, KeyError, TypeError) as error:
-            render_error = str(error)
-        payload["render_error"] = render_error
+        payload.update(tactic_templates.prepare_gold_rendering(row.tactic, trace, renderer=renderer))
         payload["model_record"] = model
         payload["request"] = {
             "rowIndex": row.row_index, "sourceStart": start, "sourceEnd": end,
@@ -97,6 +93,7 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--file-timeout", type=float, default=600)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--renderer", choices=("flat", "template-v1"), default="flat")
     args = parser.parse_args(argv)
     if args.num_theorems < 1 or not math.isfinite(args.file_timeout) or args.file_timeout <= 0:
         raise ValueError("theorem count and file timeout must be positive")
@@ -113,7 +110,7 @@ def main(argv=None):
         raise ValueError("empty theorem selection")
     caches = (SExprCache(cache_root, project_path=str(source_root)), ModelSExprCache(cache_root),
               SourceSyntaxTraceCache(cache_root))
-    planned = [_prepare_row(row, cache_root, *caches) for row in selected]
+    planned = [_prepare_row(row, cache_root, *caches, renderer=args.renderer) for row in selected]
     groups = defaultdict(list)
     for payload in planned:
         groups[payload["file_path"]].append(payload)
@@ -134,6 +131,9 @@ def main(argv=None):
         "helper_sha256": file_sha256(LEAN_HELPER),
         "runner_sha256": file_sha256(Path(__file__)),
         "renderer_sha256": file_sha256(Path(__file__).parents[1] / "atp_lean_gnn/gold_replay.py"),
+        "renderer": args.renderer,
+        "template_schema": tactic_templates.TEMPLATE_SCHEMA if args.renderer == "template-v1" else None,
+        "template_parser_sha256": file_sha256(Path(tactic_templates.__file__)),
         "rows": [{"row_index": p["row_index"], "cache_hashes": p["cache_hashes"]} for p in planned],
     }
     root = args.output_dir
@@ -177,6 +177,9 @@ def main(argv=None):
                 failure = {"status": "native_file_failed", "detail": str(error)}
         for payload in payloads:
             result = {key: payload[key] for key in ("row_index", "theorem", "file_path", "tactic", "rendered_tactic")}
+            for key in ("render_path", "flat_renderable", "flat_render_error", "template_target", "template_error_code"):
+                if key in payload:
+                    result[key] = payload[key]
             if "failure" in payload:
                 result.update(payload["failure"])
             elif failure is not None:

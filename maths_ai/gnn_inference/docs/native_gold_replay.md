@@ -34,6 +34,11 @@ additional resolution, unannotated leaves, compound syntax and fresh-name
 arguments remain explicit unsupported cases. Proof placeholders are not
 rendered as proof actions. This is not a full source-syntax renderer.
 
+Optional `--renderer template-v1` extends gold parsing/rendering for bounded
+rw/simp directions, `only` and locations, while retaining flat rendering for
+other families. See [V1 grammar and typed gold targets](tactic_templates_v1.md).
+Default remains `--renderer flat`; existing model prediction is unchanged.
+
 ## Backend and scope
 
 Use existing extraction environment:
@@ -81,6 +86,9 @@ Read final summary counts:
 
 - `selected_steps`: every selected dataset row.
 - `renderable_steps`: renderer produced a candidate string, before Lean checking.
+- `flat_renderable_steps`: old flat renderer produced text for the same rows.
+- `template_v1_parsed_steps`: V1 typed target extracted before name rendering.
+- `newly_renderable_vs_flat`: chosen mode produced text where flat mode could not.
 - `input_model_match`: live normalized inputs agree with cached model inputs.
 - `original_transition_match`: original tactic replays to recorded normalized goals.
 - `rendered_transition_match`: rendered gold references reproduce that transition.
@@ -110,4 +118,11 @@ MATHS_AI_PANTOGRAPH_ROOT=/path/to/pinned/Pantograph \
 ```
 
 Without that variable, the real-backend integration test is skipped while
-unit tests still run. No server Mathlib replay result has been measured yet.
+unit tests still run. Initial flat-renderer server results follow.
+
+The initial server three-theorem Mathlib smoke subsequently matched **7/7**
+cached normalized inputs and **7/7** original transitions; flat rendering
+matched **1/1** renderable case, with six explicitly unsupported rows. This
+does not establish a proof rate. Combined flat/V1 checks now total **50
+passed**; new V1 server cohort replay is pending. Changing code/renderer
+requires a fresh report directory rather than resuming that older report.

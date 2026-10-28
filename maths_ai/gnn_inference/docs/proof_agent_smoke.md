@@ -98,3 +98,40 @@ No general 90% theorem-solving claim or superiority over automation follows.
 This smoke establishes usable proof-completion/validation plumbing beyond
 the single published example. Next inspect the failed cancellation proofs
 and model-only case before changing prompts, training or orchestration.
+
+## Failure audit and automation-baseline correction
+
+`nat_cancel` invented `Nat.eq_of_add_eq_add_right` and repeated the same
+unknown constant on repair. This is a model error; `Nat.add_left_cancel`
+exists in the pinned Lean 4.10 core. `real_nonneg` is the reported model-only
+task: its proof supplies `sq_nonneg x` to arithmetic automation.
+
+However, the original automation portfolio used `first`, which accepts a
+branch that merely makes progress. `ring` normalized the inequality without
+closing it, preventing the later `nlinarith` branch. Thus the original 9/10
+automation result is not a fair evaluation of the intended solver portfolio.
+Model proofs/results remain valid, but model-only/union comparisons need
+the corrected baseline. Portfolio now uses `solve`, which requires closure.
+No theorem-specific rule or extra fact was added.
+
+Recheck only automation, preserving original report/model outputs, in a new
+directory (no GPU, checkpoint loading, downloads or inference):
+
+```sh
+git pull --ff-only jajos gnn-issue-fixes
+python -B -u -m maths_ai.gnn_inference.scripts.run_proof_smoke \
+  --recheck-automation maths_ai/gnn_inference/runs/deepseek_ten_task_smoke/report.json \
+  --output-dir maths_ai/gnn_inference/runs/deepseek_ten_task_automation_recheck \
+  --lean-project maths_ai/_support_files/sexpr_environment/mathlib4
+```
+
+Recheck enforces the same task list, Lean toolchain, Lake manifest and
+validator time budget. It retains old automation records, copies unchanged
+model attempts, checkpoints each new baseline result and supports `--resume`.
+Final `model_calls` remains the original count; `new_model_calls` is zero.
+
+Checks: **23 unit tests passed**. Focused real Lean checks verified closure
+after a partial branch and the corrected nonnegativity portfolio (5.72 s),
+plus `solve` and cancellation-name availability in Lean 4.10. The expanded
+full integration invocation exceeded its aggregate local time limit; it is
+not reported as passing. Corrected server baseline result is pending.

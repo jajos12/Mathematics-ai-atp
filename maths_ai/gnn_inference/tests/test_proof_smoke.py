@@ -204,6 +204,47 @@ def test_runner_loads_cached_model_once_and_binds_resume(tmp_path, monkeypatch):
         smoke.main([*argv, "--max-attempts", "1", "--resume"])
 
 
+def test_automation_recheck_preserves_source_and_model_outputs_without_loading_model(tmp_path, monkeypatch):
+    project = tmp_path / "lean"
+    project.mkdir()
+    (project / "lake-manifest.json").write_text("{}")
+    report = _report()
+    report["manifest"] = {"schema": "ten_proof_smoke_v1", "tasks": smoke.TASKS,
+                          "toolchain": "test", "lean_timeout": 120,
+                          "lake_manifest_sha256": smoke.control._sha("{}")}
+    for row in report["tasks"]:
+        row.update(complete=True, automation={"status": "passed"},
+                   attempts=[{"raw_text": "saved model proof", "lean": {"status": "passed"}}])
+    report["tasks"][3]["attempts"][0]["lean"]["status"] = "lean_rejected"
+    report["tasks"][6]["automation"]["status"] = "lean_rejected"
+    source = tmp_path / "original.json"
+    source.write_text(json.dumps(report))
+    before = source.read_text()
+    monkeypatch.setattr(smoke, "_cached_weights", lambda *a: pytest.fail("model cache accessed"))
+    monkeypatch.setattr(smoke.control, "_lean_context", lambda *a: (project, "test", ""))
+    calls = []
+
+    def validate(task, raw, context, timeout):
+        calls.append(task[0])
+        assert "\nsolve\n" in raw
+        return {"status": "passed"}
+
+    monkeypatch.setattr(smoke, "_validate", validate)
+    output = tmp_path / "rechecked"
+    argv = ["--output-dir", str(output), "--lean-project", str(project),
+            "--recheck-automation", str(source)]
+    assert smoke.main(argv) == 0
+    saved = json.loads((output / "report.json").read_text())
+    assert source.read_text() == before
+    assert [r["attempts"] for r in saved["tasks"]] == [r["attempts"] for r in report["tasks"]]
+    assert saved["summary"]["automation_solved"] == 10
+    assert saved["summary"]["solved_with_repairs"] == 9
+    assert saved["summary"]["model_only_solved"] == 0
+    assert smoke.main([*argv, "--resume"]) == 0 and len(calls) == 10
+    with pytest.raises(ValueError, match="original validator time budget"):
+        smoke.main([*argv, "--lean-timeout", "1", "--resume"])
+
+
 @pytest.mark.skipif(not os.environ.get("MATHS_AI_PROOF_SMOKE_LEAN_PROJECT"), reason="compiled Lean project required")
 def test_all_reference_tasks_and_extra_assumption_rejection_in_real_lean():
     context = smoke.control._lean_context(Path(os.environ["MATHS_AI_PROOF_SMOKE_LEAN_PROJECT"]))
@@ -222,3 +263,11 @@ def test_all_reference_tasks_and_extra_assumption_rejection_in_real_lean():
     valid = smoke._validate(task, "theorem equivalent (P Q R : Prop) (h : (P ∧ Q) ∧ R) : "
                            "P ∧ (Q ∧ R) := by exact ⟨h.1.1, h.1.2, h.2⟩", context, 120)
     assert valid["status"] == "passed", valid["diagnostics"]
+    # A normalizer may succeed without closing the goal; solve must backtrack.
+    control_task = ("portfolio_control", "logic", "True")
+    premature = smoke._validate(control_task, "first\n| skip\n| trivial", context, 120)
+    assert premature["status"] == "lean_rejected"
+    closed = smoke._validate(control_task, "solve\n| skip\n| trivial", context, 120)
+    assert closed["status"] == "passed", closed["diagnostics"]
+    nonneg = smoke._validate(smoke.TASKS[6], smoke.AUTOMATION, context, 120)
+    assert nonneg["status"] == "passed", nonneg["diagnostics"]

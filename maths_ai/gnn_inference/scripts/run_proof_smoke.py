@@ -29,7 +29,7 @@ TASKS = (
     ("list_reverse", "list", "∀ (α : Type) (xs : List α), xs.reverse.reverse = xs"),
     ("set_distrib", "set", "∀ (α : Type) (A B C : Set α), A ∩ (B ∪ C) = (A ∩ B) ∪ (A ∩ C)"),
 )
-AUTOMATION = "intros\nfirst\n| rfl\n| assumption\n| aesop (config := { maxRuleApplications := 50 })\n| omega\n| ring\n| nlinarith"
+AUTOMATION = "intros\nsolve\n| rfl\n| assumption\n| aesop (config := { maxRuleApplications := 50 })\n| omega\n| ring\n| nlinarith"
 
 
 def _task_source(task, body="sorry"):
@@ -191,6 +191,54 @@ def _run(report, generate, validate, save, max_attempts, seed):
     return _summary(report)
 
 
+def _recheck_automation(args):
+    original = args.recheck_automation.read_text()
+    report = json.loads(original)
+    manifest = report["manifest"]
+    if (manifest.get("schema") != "ten_proof_smoke_v1"
+            or control._sha(manifest["tasks"]) != control._sha(TASKS)
+            or [row["id"] for row in report["tasks"]] != [task[0] for task in TASKS]):
+        raise ValueError("Unknown smoke cohort; refusing to reassign saved model results")
+    context = control._lean_context(args.lean_project)
+    if (context[1] != manifest["toolchain"]
+            or control._sha((context[0] / "lake-manifest.json").read_text()) != manifest["lake_manifest_sha256"]):
+        raise ValueError("Recheck must use the original Lean toolchain and manifest")
+    if args.lean_timeout != manifest["lean_timeout"]:
+        raise ValueError("Recheck must retain the original validator time budget")
+    path = args.output_dir / "report.json"
+    if path.resolve() == args.recheck_automation.resolve():
+        raise ValueError("Use a separate output directory; original report stays unchanged")
+    policy = {"source_report_sha256": control._sha(original), "automation_sha256": control._sha(AUTOMATION),
+              "runner_sha256": control._sha(Path(__file__).read_text()), "model_inference": False}
+    if args.output_dir.exists() and not args.resume:
+        raise FileExistsError(f"Recheck exists: {args.output_dir}; use --resume")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        previous = json.loads(path.read_text())
+        if previous.get("automation_recheck") != policy:
+            raise ValueError("Recheck resume changes source report or automation policy")
+        report = previous
+    else:
+        report["automation_recheck"] = policy
+        for row in report["tasks"]:
+            row["automation_before_recheck"] = row.get("automation")
+            row["automation_recheck_complete"] = False
+    control._write(path, report)
+    for task, row in zip(TASKS, report["tasks"]):
+        if row["automation_recheck_complete"]:
+            continue
+        row["automation"] = _validate(task, AUTOMATION, context, args.lean_timeout)
+        row["automation_recheck_complete"] = True
+        control._write(path, report)
+        print(json.dumps({"task": task[0],
+                          "automation_before": (row["automation_before_recheck"] or {}).get("status"),
+                          "automation_after": row["automation"]["status"]}), flush=True)
+    report["summary"] = _summary(report)
+    control._write(path, report)
+    print(json.dumps({"report": str(path), "new_model_calls": 0, **report["summary"]}), flush=True)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -205,11 +253,14 @@ def main(argv=None):
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--lean-timeout", type=float, default=120)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--recheck-automation", type=Path)
     args = parser.parse_args(argv)
     if (args.context_tokens <= args.max_new_tokens or args.max_new_tokens < 1 or args.seed < 0
             or not math.isfinite(args.request_timeout) or args.request_timeout <= 0
             or not math.isfinite(args.lean_timeout) or args.lean_timeout <= 0):
         raise ValueError("Invalid generation/context budget or seed")
+    if args.recheck_automation:
+        return _recheck_automation(args)
     args.backend, args.min_free_disk_gib, args.local_files_only = "transformers", 1, True
     cache = _cached_weights(args.hf_cache)
     runtime = control._preflight(args)

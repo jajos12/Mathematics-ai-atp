@@ -243,3 +243,10 @@ document were removed at the user's request. Existing V2 library scoring
 and the frozen dual-encoder retriever remain the baseline. Finalized local
 cues above are retained. Historical results are recorded in the weekly
 reports and Git history; no library-query upgrade was adopted.
+
+### Next integration milestone
+
+[Source-native gold replay](native_gold_replay.md) checks original and
+rendered recorded tactics from actual source-context snapshots before
+connecting the accepted normalized model to Lean. It measures step-level
+input/transition parity, not proof-search success.

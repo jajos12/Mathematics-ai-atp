@@ -233,39 +233,13 @@ and often missing library-function types; `apply` requires stronger
 unification/elaboration. Live normalized-state parity and Lean-checked
 execution are follow-up work before serving, not claims of this experiment.
 
-### Next workstream: global lemma identity in the existing decoder
+### Abandoned library-query experiment
 
-Keep frozen epoch-5 top-200 candidate IDs and the finalized local baseline.
-The historical reference is **62/408** library identities, teacher-forced on
-actions whose entire gold sequence is reachable, equal to frozen text order.
-The denominator is positions, not 408 whole actions; missing retrieval is a
-separate limitation. Before modifying the library component, remeasure it
-with the epoch-8 local checkpoint: local training changed the shared
-`argument_selector.out_proj`, which also scores adapted library vectors.
-
-Current library logits are `text_score * exp(log_inverse_text_temperature)`
-plus `tanh(library_residual_scale) * score_candidates(GRU_hidden, adapted_text)`.
-GRU hidden already contains tactic and selected-prefix context. Library
-identity loss is trained only on fully reachable actions; retrieval misses
-provide source-prefix supervision but no library identity loss. The original
-joint pilot used three epochs of 500 train batches, not full library-only
-supervision. A small scalar alone does not establish a negligible residual:
-measure actual per-pool contribution and resulting rank changes.
-
-Read-only validation audit compares frozen text, original joint V2 and
-epoch-8 local checkpoints on the same **408** reachable positions. Report
-top-1/top-5/MRR by tactic and slot, rank gains/losses, residual/prior score
-spread, and whether gold-prefix context changes library scores or favors
-already-used lemmas. Hold tactic and previous references at gold only for
-this diagnostic. This does not measure greedy sequence accuracy.
-
-Use the findings to modify the existing decoder's library component, not a
-separate standalone model. Any trainable library changes must preserve the
-local projection and fixed graph/tactic/count/GRU components initially, and
-be selected on training/validation without changing candidate policy. Final
-acceptance includes local **169/277**, oracle nonempty **75/759**, predicted
-nonempty **27/759**, library ranks, and source choice with finalized local
-cues. The opt-in independent library query and frozen-component trainer are
-implemented; server training is pending. See the
-[library identity probe](library_identity_probe.md) for the measured audit,
-architecture, candidate/prefix denominators and resumable pilot command.
+Three optional library-query pilots improved conditional library ranks but
+reduced predicted nonempty whole-action exact from baseline **27/759** to
+**26**, **25** and **23/759**. The independent query head, key-space modes,
+preservation-loss trainer, experiment-specific tests and dedicated probe
+document were removed at the user's request. Existing V2 library scoring
+and the frozen dual-encoder retriever remain the baseline. Finalized local
+cues above are retained. Historical results are recorded in the weekly
+reports and Git history; no library-query upgrade was adopted.

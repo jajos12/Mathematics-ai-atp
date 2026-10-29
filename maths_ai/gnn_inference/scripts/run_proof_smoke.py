@@ -158,8 +158,11 @@ def _summary(report):
             "note": "Curated compatibility smoke, not held-out accuracy or causal feedback ablation."}
 
 
-def _run(report, generate, validate, save, max_attempts, seed):
-    for index, (task, row) in enumerate(zip(TASKS, report["tasks"])):
+def _run(report, generate, validate, save, max_attempts, seed, *,
+         tasks=None, messages_factory=None, automation_first=False):
+    tasks = TASKS if tasks is None else tasks
+    messages_factory = _messages if messages_factory is None else messages_factory
+    for index, (task, row) in enumerate(zip(tasks, report["tasks"])):
         if row.get("complete") or any(a.get("lean", {}).get("status") == "passed" for a in row["attempts"]):
             row["complete"] = True
             save()
@@ -167,6 +170,10 @@ def _run(report, generate, validate, save, max_attempts, seed):
         if "automation" not in row:
             row["automation"] = validate(task, AUTOMATION)
             save()
+        if automation_first and row["automation"]["status"] == "passed":
+            row["complete"] = True
+            save()
+            continue
         while len(row["attempts"]) < max_attempts or (
                 row["attempts"] and "lean" not in row["attempts"][-1]):
             if row["attempts"] and "lean" not in row["attempts"][-1]:
@@ -176,12 +183,12 @@ def _run(report, generate, validate, save, max_attempts, seed):
                 attempt_seed = seed + index * 10 + len(row["attempts"])
                 report["generation_requests_started"] = report.get("generation_requests_started", 0) + 1
                 save()
-                attempt = generate(_messages(task, previous), attempt_seed)
+                attempt = generate(messages_factory(task, previous), attempt_seed)
                 row["attempts"].append(attempt)
                 save()  # Preserve raw completion before compiler execution.
             attempt["lean"] = validate(task, attempt["raw_text"])
             save()
-            print(json.dumps({"task": task[0], "attempt": len(row["attempts"]),
+            print(json.dumps({"task": row["id"], "attempt": len(row["attempts"]),
                               "status": attempt["lean"]["status"], "done_reason": attempt.get("done_reason"),
                               "output_tokens": attempt.get("output_tokens")}), flush=True)
             if attempt["lean"]["status"] == "passed":

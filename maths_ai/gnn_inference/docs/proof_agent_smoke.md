@@ -135,3 +135,9 @@ after a partial branch and the corrected nonnegativity portfolio (5.72 s),
 plus `solve` and cancellation-name availability in Lean 4.10. The expanded
 full integration invocation exceeded its aggregate local time limit; it is
 not reported as passing. Corrected server baseline result is pending.
+
+Corrected server recheck subsequently completed: automation **10/10**, model
+unchanged **9/10** (8 first try), **0 model-only / 1 automation-only**, zero
+new model calls. Thus this curated set shows no model-added coverage.
+Next development cohort is the pinned, stratified
+[miniF2F validation set](minif2f_development.md), not ad-hoc harder replacements.

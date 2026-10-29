@@ -13,7 +13,8 @@ from maths_ai.gnn_inference.atp_lean_gnn.dataset import DatasetRow
 from maths_ai.gnn_inference.atp_lean_gnn.preparation import ModelSExprCache, SExprCache, SourceSyntaxTraceCache
 from maths_ai.gnn_inference.atp_lean_gnn.gold_replay import (
     FlatReference, RenderError, assess_replay, goal_signature, model_input_matches,
-    render_flat_action, render_trace_action, run_native_file, select_theorems, summarize_replays,
+    reference_from_identifier, render_flat_action, render_trace_action, run_native_file,
+    select_theorems, summarize_replays,
 )
 
 
@@ -65,6 +66,23 @@ def test_trace_renderer_uses_resolved_names_and_never_guesses_unannotated_leaves
         render_trace_action("simp only [foo]", trace)
 
 
+def test_reference_head_cannot_replace_method_receivers_or_unknown_aliases():
+    method = {"tag": "identifier", "source": "FiniteDimensional.finrank_pos.ne'",
+              "semanticRole": "global", "name": "LT.lt.ne'"}
+    with pytest.raises(RenderError, match="non_bare_reference"):
+        reference_from_identifier(method, [])
+    shadowed = {"tag": "identifier", "source": "Nat.add_zero", "semanticRole": "global", "name": "Nat.add_zero"}
+    context = [{"context_index": 0, "user_name": "Nat"}]
+    with pytest.raises(RenderError, match="possible local method receiver"):
+        reference_from_identifier(shadowed, context)
+    assert reference_from_identifier({**shadowed, "source": "_root_.Nat.add_zero"}, context) == (
+        FlatReference("library", "Nat.add_zero")
+    )
+    assert reference_from_identifier({**shadowed, "source": "add_zero"}, []) == (
+        FlatReference("library", "Nat.add_zero")
+    )
+
+
 def _goal(target="(:c P)"):
     return {"target": {"modelSexp": target, "modelSexpVersion": 1}, "vars": [
         {"contextIndex": 0, "userName": "h", "binderRole": ":explicit",
@@ -101,6 +119,27 @@ def test_goal_signature_keeps_local_let_values_and_requires_versioned_ast():
     del b["target"]["modelSexpVersion"]
     with pytest.raises(ValueError, match="normalized expression"):
         goal_signature([b])
+
+
+def test_source_control_text_diagnostic_and_dataset_alignment_are_separate():
+    native = {"row_index": 7, "original_control": "captured_syntax", "source_tactic": "obtain ...\n  · ...",
+              "source_before": [_goal()], "source_after": [],
+              "original": {"status": "executed", "goals": []},
+              "original_text": {"status": "parse_error", "message": "expected end of input"},
+              "rendered": {"status": "executed", "goals": []}}
+    assessed = assess_replay(native, _model_record())
+    assert assessed["status"] == "rendered_transition_match"
+    assert assessed["original_transition_match"] and not assessed["original_text_executed"]
+    assert assessed["original_text_error"] == "expected end of input"
+    source_only = {**assessed, "alignment_kind": "branch_opener", "dataset_target_matches_source": False}
+    exact = {**assessed, "row_index": 8, "alignment_kind": "exact", "dataset_target_matches_source": True}
+    summary = summarize_replays([source_only, exact])
+    assert summary["original_transition_match"] == 2
+    assert summary["original_text_transition_match"] == 0
+    assert summary["dataset_aligned_original_matches"] == summary["dataset_aligned_rendered_matches"] == 1
+    assert summary["dataset_exact_alignment_steps"] == 1
+    invalid_input = {**exact, "input_model_match": False}
+    assert summarize_replays([invalid_input])["dataset_aligned_rendered_matches"] == 0
 
 
 def test_theorem_selection_is_independent_of_input_order_and_target_support():
@@ -188,6 +227,7 @@ def test_native_replay_restores_branches_preserves_siblings_and_source_environme
         assert goal_signature(row["source_before"]) == goal_signature(expected["goalsBefore"])
         assert goal_signature(row["source_after"]) == goal_signature(expected["goalsAfter"])
         assert row["original"]["status"] == "executed", row
+        assert row["original_control"] == "captured_syntax"
         assert row["rendered"]["status"] == "executed", row
         assert goal_signature(row["original"]["goals"]) == goal_signature(row["source_after"])
         assert goal_signature(row["rendered"]["goals"]) == goal_signature(row["source_after"])
@@ -200,6 +240,69 @@ def test_native_replay_restores_branches_preserves_siblings_and_source_environme
     future = response["rows"][-1]["rendered"]
     assert future["status"] == "lean_error"
     assert "unknown" in future["message"].lower(), future
+
+
+def test_native_original_syntax_survives_sequence_reparse_and_derived_refs_are_quarantined():
+    configured = os.environ.get("MATHS_AI_PANTOGRAPH_ROOT")
+    if not configured:
+        pytest.skip("set MATHS_AI_PANTOGRAPH_ROOT for pinned native regressions")
+    from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import (
+        PantographInvocationClient, _make_source_syntax_trace_record,
+    )
+    from maths_ai.gnn_inference.atp_lean_gnn.tactic_templates import prepare_gold_rendering
+
+    root = Path(configured).resolve()
+    fixture = (Path(__file__).parent / "fixtures/native_replay.lean").read_bytes()
+    with tempfile.TemporaryDirectory(prefix="ReplayRegression_", dir=root) as temporary:
+        source = Path(temporary) / "Example.lean"
+        source.write_bytes(fixture)
+
+        async def capture():
+            client = PantographInvocationClient(source_root=root, pantograph_repl=root / ".lake/build/bin/repl",
+                                                 capture_model_sexprs=True)
+            try:
+                return await client.process_file(str(source.relative_to(root)))
+            finally:
+                await client.close()
+
+        units = asyncio.run(capture())
+        assert all(not unit.get("messages") for unit in units), units
+        requests, identified, prepared_rows = [], set(), {}
+        for u, unit in enumerate(units):
+            for v, invocation in enumerate(unit.get("invocations", [])):
+                text = invocation["tactic"].strip()
+                if text in {"exact witness.finish", "simp only [witness.finish]"}:
+                    key = text
+                elif text.startswith("obtain") and "\n" in text:
+                    key = "sequence"
+                else:
+                    continue
+                if key in identified:
+                    continue
+                identified.add(key)
+                row_id = len(requests)
+                row = DatasetRow(invocation["goalBefore"], "ReplaySmoke", text, "val", row_id)
+                trace = _make_source_syntax_trace_record(row, {"invocation": invocation}, {})
+                prepared = prepare_gold_rendering(text, trace, renderer="template-v1")
+                assert prepared["rendered_tactic"] is None, prepared
+                prepared_rows[key] = (row_id, prepared)
+                syntax = trace["source_syntax"]
+                requests.append({"rowIndex": row_id, "unitIndex": u, "invocationIndex": v,
+                                 "sourceStart": syntax["sourceStart"], "sourceEnd": syntax["sourceEnd"],
+                                 "renderedTactic": None})
+        assert identified == {"exact witness.finish", "simp only [witness.finish]", "sequence"}
+        response = run_native_file(source, requests, source_root=root, pantograph_root=root, timeout=120)
+    assert not response["frontend_errors"], response
+    by_id = {r["row_index"]: r for r in response["rows"]}
+    for native in by_id.values():
+        assert native["original_control"] == "captured_syntax"
+        assert native["original"]["status"] == "executed", native
+        assert goal_signature(native["original"]["goals"]) == goal_signature(native["source_after"])
+    sequence = by_id[prepared_rows["sequence"][0]]
+    assert sequence["original_text"]["status"] in {"parse_error", "lean_error"}, sequence
+    assert "\n" in sequence["source_tactic"]
+    assert "non_bare_reference" in prepared_rows["exact witness.finish"][1]["render_error"]
+    assert prepared_rows["simp only [witness.finish]"][1]["template_error_code"] == "non_bare_reference"
 
 
 def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch):
@@ -231,6 +334,7 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
                "state_sha256": SExprCache.row_state_sha256(row),
                "tactic_sha256": SExprCache.row_tactic_sha256(row),
                "target_state_sha256": SExprCache.row_target_state_sha256(row),
+               "alignment_kind": "exact", "target_state_matches_invocation": True,
                "unit_index": 0, "invocation_index": row.row_index}
         raw_cache.save("val", row.row_index, raw)
         model_cache.save("val", row.row_index, {
@@ -261,6 +365,7 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
         calls.append(requests)
         return {"frontend_errors": [], "rows": [
             {"row_index": r["rowIndex"], "source_before": [_goal()], "source_after": [],
+             "original_control": "captured_syntax",
              "original": {"status": "executed", "goals": []},
              "rendered": {"status": "executed", "goals": []} if r["renderedTactic"] else
                          {"status": "not_rendered"}}
@@ -276,10 +381,13 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
     assert runner.main(argv) == 0
     report = json.loads((output / "report.json").read_text())
     assert report["complete"]
+    assert report["manifest"]["schema"] == "native_gold_step_replay_v2"
+    assert report["manifest"]["original_replay_mode"] == "captured_syntax"
     assert report["summary"]["selected_steps"] == 2
     assert report["summary"]["status_counts"] == {"rendered_transition_match": 1, "render_unsupported": 1}
     assert report["summary"]["original_transition_match"] == 2
     assert report["summary"]["proof_success_measured"] is False
+    assert report["summary"]["dataset_aligned_original_matches"] == 2
     assert runner.main([*argv, "--resume"]) == 0
     assert len(calls) == 1
     with pytest.raises(ValueError, match="resume bindings changed"):
@@ -306,6 +414,20 @@ def test_replay_runner_retains_failures_and_resume_binding(tmp_path, monkeypatch
     broken = json.loads((broken_output / "report.json").read_text())
     assert broken["summary"]["status_counts"] == {"native_file_failed": 2}
     assert broken["summary"]["selected_steps"] == 2
+    monkeypatch.setattr(runner, "run_native_file", replay)
+
+    def obsolete_control(*args, **kwargs):
+        response = replay(*args, **kwargs)
+        for result in response["rows"]:
+            result.pop("original_control")
+        return response
+
+    monkeypatch.setattr(runner, "run_native_file", obsolete_control)
+    obsolete_output = tmp_path / "obsolete_control"
+    assert runner.main([*argv, "--output-dir", str(obsolete_output)]) == 2
+    obsolete = json.loads((obsolete_output / "report.json").read_text())
+    assert obsolete["summary"]["status_counts"] == {"native_file_failed": 2}
+    assert all("control mode" in r["detail"] for r in obsolete["files"]["A.lean"]["rows"])
     monkeypatch.setattr(runner, "run_native_file", replay)
 
     # A stale cache is counted, not silently dropped from the selected cohort.

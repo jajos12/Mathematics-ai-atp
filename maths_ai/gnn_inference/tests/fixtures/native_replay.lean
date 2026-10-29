@@ -33,4 +33,21 @@ theorem letProof (n : Nat) : n = n := by
 theorem instanceProof {α : Type} [Inhabited α] : Nonempty α := by
   exact Nonempty.intro default
 
+structure Receiver where
+  proof : True
+
+def Receiver.finish (self : Receiver) : True := self.proof
+def witness : Receiver := ⟨True.intro⟩
+
+theorem derivedProof : True := by
+  exact witness.finish
+
+theorem derivedSimp : True := by
+  simp only [witness.finish]
+
+theorem obtainBranches (P Q : Prop) (h : P ∨ Q) : Q ∨ P := by
+  obtain hp | hq := h
+  · exact Or.inr hp
+  · exact Or.inl hq
+
 end ReplaySmoke

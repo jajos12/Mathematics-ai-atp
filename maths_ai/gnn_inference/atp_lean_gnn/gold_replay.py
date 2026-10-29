@@ -17,6 +17,7 @@ from .labels import clean_tactic_markup
 
 
 LEAN_HELPER = Path(__file__).resolve().parents[1] / "lean" / "ReplayGold.lean"
+ORIGINAL_REPLAY_MODE = "captured_syntax"
 
 
 class RenderError(ValueError):
@@ -27,6 +28,46 @@ class RenderError(ValueError):
 class FlatReference:
     source: str
     identity: int | str  # Local context index, or fully qualified library name.
+
+
+def reference_from_identifier(node: dict, local_context: list[dict]) -> FlatReference:
+    """Conservative spelling check before replacing an annotated expression head.
+
+    Current annotations can identify a method application's head, not the
+    entire expression. Declaration suffix spelling is necessary here, not
+    a proof of term equivalence; renamed aliases need a native resolver.
+    """
+    if node.get("tag") != "identifier" or not isinstance(node.get("source"), str):
+        raise RenderError("bare resolved identifier required")
+    source_parts = _name_parts(node["source"])
+    role = node.get("semanticRole")
+    if role == "local" and type(node.get("contextIndex")) is int:
+        entries = [item for item in local_context
+                   if item.get("contextIndex", item.get("context_index")) == node["contextIndex"]]
+        if len(entries) != 1:
+            raise RenderError("local reference absent or duplicated in context")
+        name = str(entries[0].get("userName", entries[0].get("user_name", "")))
+        if source_parts != _name_parts(name):
+            raise RenderError("non_bare_reference: local spelling requires expression/alias resolution")
+        return FlatReference("local", node["contextIndex"])
+    if role in {"global", "constructor"} and isinstance(node.get("name"), str):
+        rooted = source_parts[0] == "_root_"
+        if rooted:
+            source_parts = source_parts[1:]
+        declaration = _name_parts(node["name"])
+        if declaration[0] == "_root_":
+            declaration = declaration[1:]
+        if not source_parts or declaration[-len(source_parts):] != source_parts:
+            raise RenderError("non_bare_reference: derived expression or renamed alias is not a declaration suffix")
+        if not rooted:
+            for item in local_context:
+                name = str(item.get("userName", item.get("user_name", "")))
+                if name:
+                    prefix = _name_parts(name)
+                    if len(source_parts) > len(prefix) and source_parts[:len(prefix)] == prefix:
+                        raise RenderError("non_bare_reference: possible local method receiver")
+        return FlatReference("library", node["name"])
+    raise RenderError("unresolved source identifier")
 
 
 def _name_parts(name: str) -> list[str]:
@@ -132,12 +173,9 @@ def render_trace_action(raw_tactic: str, trace: dict, *, max_args: int = 3) -> s
         if node.get("tag") != "identifier":
             continue
         role = node.get("semanticRole")
-        if role in {"global", "constructor"}:
-            reference = FlatReference("library", node["name"])
-        elif role == "local":
-            reference = FlatReference("local", node["contextIndex"])
-        else:
+        if role not in {"global", "constructor", "local"}:
             continue
+        reference = reference_from_identifier(node, trace["local_context"])
         annotations.setdefault(node["source"], set()).add(reference)
     references = []
     for token in tokens:
@@ -190,9 +228,13 @@ def assess_replay(native: dict, model_record: dict, *, render_error: str | None 
         result["detail"] = native.get("message", "")
         return result
     try:
+        result["original_control"] = native.get("original_control", "unspecified")
+        result["source_tactic"] = native.get("source_tactic", "")
         result["input_model_match"] = model_input_matches(native["source_before"], model_record)
         expected = goal_signature(native["source_after"])
-        for name in ("original", "rendered"):
+        for name in ("original", "original_text", "rendered"):
+            if name == "original_text" and name not in native:
+                continue
             branch = native[name]
             result[f"{name}_executed"] = branch.get("status") == "executed"
             result[f"{name}_transition_match"] = (
@@ -266,8 +308,22 @@ def summarize_replays(rows: list[dict]) -> dict:
         "template_v1_parsed_steps": sum(r.get("template_target") is not None for r in rows),
         "newly_renderable_vs_flat": sum(isinstance(r.get("rendered_tactic"), str)
                                         and r.get("flat_renderable") is False for r in rows),
+        "original_control_modes": dict(Counter(r.get("original_control", "unavailable") for r in rows)),
+        "source_alignment_kinds": dict(Counter(r.get("alignment_kind", "unknown") for r in rows)),
+        "dataset_exact_alignment_steps": sum(r.get("alignment_kind") == "exact"
+                                             and r.get("dataset_target_matches_source") is True for r in rows),
+        "dataset_aligned_original_matches": sum(r.get("alignment_kind") == "exact"
+                                                and r.get("dataset_target_matches_source") is True
+                                                and bool(r.get("input_model_match"))
+                                                and bool(r.get("original_transition_match")) for r in rows),
+        "dataset_aligned_rendered_matches": sum(r.get("alignment_kind") == "exact"
+                                                and r.get("dataset_target_matches_source") is True
+                                                and bool(r.get("input_model_match"))
+                                                and bool(r.get("original_transition_match"))
+                                                and bool(r.get("rendered_transition_match")) for r in rows),
         **{name: sum(bool(r.get(name)) for r in rows) for name in (
             "input_model_match", "original_executed", "original_transition_match",
+            "original_text_executed", "original_text_transition_match",
             "rendered_executed", "rendered_transition_match",
         )},
         "proof_success_measured": False,

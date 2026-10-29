@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from .action_targets import ActionTargetError, compile_source_syntax_trace
-from .gold_replay import FlatReference, RenderError, render_trace_action, resolve_references
+from .gold_replay import (
+    FlatReference, RenderError, reference_from_identifier, render_trace_action, resolve_references,
+)
 from .labels import clean_tactic_markup, normalize_tactic
 
 
@@ -109,15 +111,13 @@ def _marker(node, token):
     return True
 
 
-def _reference(node):
+def _reference(node, local_context):
     if not isinstance(node, dict) or node.get("tag") != "identifier":
         raise TemplateError("compound_rule_term", "V1 requires a bare resolved reference")
-    role = node.get("semanticRole")
-    if role == "local" and type(node.get("contextIndex")) is int:
-        return FlatReference("local", node["contextIndex"])
-    if role in {"global", "constructor"} and isinstance(node.get("name"), str):
-        return FlatReference("library", node["name"])
-    raise TemplateError("unresolved_reference", "identifier has no supported semantic annotation")
+    try:
+        return reference_from_identifier(node, local_context)
+    except RenderError as error:
+        raise TemplateError("non_bare_reference", str(error)) from error
 
 
 def _separated(node, parse):
@@ -132,19 +132,19 @@ def _separated(node, parse):
     return tuple(result)
 
 
-def _rw_rule(node):
+def _rw_rule(node, local_context):
     direction, term = _children(node, "Lean.Parser.Tactic.rwRule", 2)
-    return TemplateRule(_reference(term), backward=_marker(direction, "←"))
+    return TemplateRule(_reference(term, local_context), backward=_marker(direction, "←"))
 
 
-def _simp_rule(node):
+def _simp_rule(node, local_context):
     direction, erase, term = _children(node, "Lean.Parser.Tactic.simpLemma", 3)
     if not _empty(direction) or not _empty(erase):
         raise TemplateError("simp_rule_modifier", "reverse/erase simp arguments are outside V1")
-    return TemplateRule(_reference(term))
+    return TemplateRule(_reference(term, local_context))
 
 
-def _location(node):
+def _location(node, local_context):
     if _empty(node):
         return TemplateLocation()
     location, = _children(node, "null", 1)
@@ -159,7 +159,7 @@ def _location(node):
         raise TemplateError("combined_location", "goal plus hypothesis needs a later grammar extension")
     if len(names) != 1:
         raise TemplateError("location_budget", "V1 allows exactly one local location")
-    reference = _reference(names[0])
+    reference = _reference(names[0], local_context)
     return TemplateLocation("local", reference)
 
 
@@ -188,7 +188,8 @@ def parse_rw_simp_trace(trace: dict) -> RwSimpTemplate:
         left, rules, right = _children(sequence, "Lean.Parser.Tactic.rwRuleSeq", 3)
         _atom(left, "[")
         _atom(right, "]")
-        return RwSimpTemplate("rw", _separated(rules, _rw_rule), location=_location(location))
+        rules = _separated(rules, lambda item: _rw_rule(item, trace["local_context"]))
+        return RwSimpTemplate("rw", rules, location=_location(location, trace["local_context"]))
     if kind == "Lean.Parser.Tactic.simp":
         keyword, config, discharger, only, sequence, location = _children(root, kind, 6)
         _atom(keyword, "simp")
@@ -199,8 +200,9 @@ def parse_rw_simp_trace(trace: dict) -> RwSimpTemplate:
             left, arguments, right = _children(sequence, "null", 3)
             _atom(left, "[")
             _atom(right, "]")
-            rules = _separated(arguments, _simp_rule)
-        return RwSimpTemplate("simp", rules, only=_marker(only, "only"), location=_location(location))
+            rules = _separated(arguments, lambda item: _simp_rule(item, trace["local_context"]))
+        return RwSimpTemplate("simp", rules, only=_marker(only, "only"),
+                              location=_location(location, trace["local_context"]))
     raise TemplateError("family_outside_v1", f"unsupported tactic root {kind!r}")
 
 

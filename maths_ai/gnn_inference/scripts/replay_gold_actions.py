@@ -16,7 +16,7 @@ from pathlib import Path
 from maths_ai.gnn_inference.atp_lean_gnn.bundle import file_sha256
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DATASET_NAME, iter_dataset_rows
 from maths_ai.gnn_inference.atp_lean_gnn.gold_replay import (
-    LEAN_HELPER, assess_replay, run_native_file,
+    LEAN_HELPER, ORIGINAL_REPLAY_MODE, assess_replay, run_native_file,
     select_theorems, summarize_replays,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.preparation import ModelSExprCache, SExprCache, SourceSyntaxTraceCache
@@ -60,6 +60,8 @@ def _prepare_row(row, cache_root, raw_cache, model_cache, trace_cache, *, render
         raw = raw_cache.load_for_row(row, extractor_version=SExprCache.EXTRACTOR_VERSION)
         if raw is None:
             raise ValueError("missing or invalid source-invocation cache")
+        payload["alignment_kind"] = raw.get("alignment_kind", "unknown")
+        payload["dataset_target_matches_source"] = bool(raw.get("target_state_matches_invocation", False))
         model = model_cache.load_for_raw_record(row.split, row.row_index, raw)
         trace = trace_cache.load_for_raw_record(row.split, row.row_index, raw)
         if model is None or trace is None:
@@ -120,7 +122,8 @@ def main(argv=None):
         path.relative_to(source_root)
         source_hashes[file_path] = file_sha256(path)
     manifest = {
-        "schema": "native_gold_step_replay_v1", "dataset": args.dataset_name, "split": args.split,
+        "schema": "native_gold_step_replay_v2", "original_replay_mode": ORIGINAL_REPLAY_MODE,
+        "dataset": args.dataset_name, "split": args.split,
         "seed": args.seed, "requested_theorems": args.num_theorems,
         "selected_theorems": [{"file_path": file, "theorem": theorem}
                               for file, theorem in sorted({(p["file_path"], p["theorem"]) for p in planned})],
@@ -165,6 +168,9 @@ def main(argv=None):
                     raise ValueError("invalid native replay response")
                 if response.get("frontend_errors"):
                     raise RuntimeError("original source compilation errors: " + "\n".join(response["frontend_errors"]))
+                if any(r.get("status", "captured") == "captured"
+                       and r.get("original_control") != ORIGINAL_REPLAY_MODE for r in response["rows"]):
+                    raise ValueError("native replay control mode does not match report policy")
                 if file_sha256(source_root / file_path) != source_hashes[file_path]:
                     raise ValueError("source file changed during replay")
                 native = {r["row_index"]: r for r in response["rows"]}
@@ -177,7 +183,8 @@ def main(argv=None):
                 failure = {"status": "native_file_failed", "detail": str(error)}
         for payload in payloads:
             result = {key: payload[key] for key in ("row_index", "theorem", "file_path", "tactic", "rendered_tactic")}
-            for key in ("render_path", "flat_renderable", "flat_render_error", "template_target", "template_error_code"):
+            for key in ("render_path", "flat_renderable", "flat_render_error", "template_target", "template_error_code",
+                        "alignment_kind", "dataset_target_matches_source"):
                 if key in payload:
                     result[key] = payload[key]
             if "failure" in payload:

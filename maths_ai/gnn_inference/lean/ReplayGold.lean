@@ -20,13 +20,8 @@ def replayOptions : Protocol.Options := {
   automaticMode := true
 }
 
-def replayBranch (snapshot : GoalState) (text : String) : MetaM Json := do
+def replaySyntaxBranch (snapshot : GoalState) (stx : Syntax) : MetaM Json := do
   try
-    snapshot.restoreMetaM
-    let stx ← match Parser.runParserCategory snapshot.env `tactic text with
-      | .ok stx => pure stx
-      | .error message => return Json.mkObj [
-          ("status", toJson "parse_error"), ("message", toJson message)]
     let action : Elab.Tactic.TacticM GoalState := do
       snapshot.savedState.restore
       -- Restore all active goals, never focus/drop sibling obligations.
@@ -42,6 +37,17 @@ def replayBranch (snapshot : GoalState) (text : String) : MetaM Json := do
     return Json.mkObj [("status", toJson "lean_error"),
       ("message", toJson (← exception.toMessageData.toString))]
 
+def replayBranch (snapshot : GoalState) (text : String) : MetaM Json := do
+  try
+    snapshot.restoreMetaM
+    match Parser.runParserCategory snapshot.env `tactic text with
+    | .ok stx => replaySyntaxBranch snapshot stx
+    | .error message => pure <| Json.mkObj [
+        ("status", toJson "parse_error"), ("message", toJson message)]
+  catch exception =>
+    return Json.mkObj [("status", toJson "lean_error"),
+      ("message", toJson (← exception.toMessageData.toString))]
+
 def replayInvocation (invocation : Frontend.TacticInvocation)
     (request : ReplayRequest) : IO Json := do
   invocation.ctx.runMetaM {} do
@@ -53,15 +59,19 @@ def replayInvocation (invocation : Frontend.TacticInvocation)
         invocation.info.goalsAfter.toArray.mapM fun goal => do
           serializeGoal replayOptions goal (← goal.getDecl)
       let source := invocation.info.stx.reprint.getD (toString invocation.info.stx) |>.trim
-      let original ← replayBranch snapshot source
+      -- Gold control keeps original layout/hygiene in the captured syntax.
+      -- Text reparsing is a separate diagnostic, never substituted for control.
+      let original ← replaySyntaxBranch snapshot invocation.info.stx
+      let originalText ← replayBranch snapshot source
       let rendered ← match request.renderedTactic with
         | some text => replayBranch snapshot text
         | none => pure <| Json.mkObj [("status", toJson "not_rendered")]
       return Json.mkObj [
         ("row_index", toJson request.rowIndex),
+        ("original_control", toJson "captured_syntax"),
         ("source_tactic", toJson source),
         ("source_before", toJson before), ("source_after", toJson after),
-        ("original", original), ("rendered", rendered)]
+        ("original", original), ("original_text", originalText), ("rendered", rendered)]
 
 unsafe def main (args : List String) : IO UInt32 := do
   let [sourcePath, requestsPath, outputPath] := args

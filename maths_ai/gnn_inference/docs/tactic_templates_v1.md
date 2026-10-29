@@ -56,6 +56,13 @@ exact pinned syntax constructors, child counts, keywords and punctuation.
 Template extraction and reference rendering are separate: a private global
 may be a valid typed target but still need a resolver before rendering.
 
+Global-head annotations alone are insufficient for bare-reference targets:
+derived dotted expressions can elaborate to a function applied to a receiver.
+Shared conservative source/declaration spelling checks reject those cases
+in both flat and V1 paths instead of discarding receiver arguments. Some
+genuine renamed aliases also need a native resolver and remain unsupported.
+Existing training labels are not silently relabeled.
+
 ## Gold replay
 
 Pull published code, then from server repository root in `atp`:
@@ -65,14 +72,16 @@ python -B -u -m maths_ai.gnn_inference.scripts.replay_gold_actions \
   --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
   --pantograph-root maths_ai/_support_files/sexpr_environment/Pantograph \
   --cache-root maths_ai/_support_files/artifacts/prepared/v1 \
-  --output-dir maths_ai/gnn_inference/runs/native_gold_replay_template_v1 \
+  --output-dir maths_ai/gnn_inference/runs/native_gold_replay_template_v1_recheck \
   --renderer template-v1 --split val --num-theorems 20 --seed 42 --file-timeout 600
 ```
 
 Same source-native snapshots, pinned toolchain and row-selection policy as
-[gold replay](native_gold_replay.md); original and rendered branches are
-restored independently and every active goal is compared. Use a new report
-directory: renderer, schema and parser-code hashes are resume-bound.
+[gold replay](native_gold_replay.md); captured-syntax original control,
+source-text diagnostic and rendered branches restore independently and
+every active goal is compared. Report v2 separates source-block replay from
+exact dataset-step alignment. Use a new report directory: control policy,
+renderer, schema and parser-code hashes are resume-bound.
 
 The report includes `template_target`, `template_error_code`, `render_path`
 and `flat_renderable` per row. Summary adds:
@@ -86,17 +95,28 @@ and `flat_renderable` per row. Summary adds:
 Static renderability is not execution accuracy. All unsupported/failing
 rows remain in the selected denominator. Typed gold structures are supplied
 from recorded syntax, not predicted by a model. Full prepared-train V1
-coverage and server native replay remain unmeasured at implementation time.
+coverage remains unmeasured. First server results follow.
 
 ## Verification and next gate
 
-**50 focused tests pass** with real pinned-backend integration enabled.
+**53 focused tests pass** with real pinned-backend integration enabled.
 Native fixtures cover directions, local locations, `simp only`, empty simp
 lists, mixed directions, repeated references, trailing commas and three
 rules plus a fourth location reference. Combined locations, applied rules
 and `simp [*]` are rejected; original source tactics still replay correctly.
 Unit tests check wrapper boundaries, role/scope validation, serialized
 targets, separate resolution failures and renderer-mode resume isolation.
+Regressions additionally cover captured multi-line syntax that fails text
+reparsing and receiver-bearing references rejected by both renderers.
+
+First fixed 20-theorem server cohort: **86/86** input parity, **85/86**
+original transitions, **27** renderable versus **14** old-flat, **26/27**
+rendered matches. All **13/13** newly renderable cases passed. One original
+text-reparse failure and one old-flat method-receiver failure motivated
+report-v2 control/resolution fixes. The command above rechecks the same
+cohort in a fresh directory; its server outcome is still pending. Source
+invocations can include full branch blocks, so source-transition totals
+must not be reported as exact dataset-step matches.
 
 Evaluate native replay and exact grammar coverage before exporting training
 targets or adding a template-aware prediction head. Keep old flat cohort and

@@ -114,10 +114,74 @@ original transitions, **27** renderable versus **14** old-flat, **26/27**
 rendered matches. All **13/13** newly renderable cases passed. One original
 text-reparse failure and one old-flat method-receiver failure motivated
 report-v2 control/resolution fixes. The command above rechecks the same
-cohort in a fresh directory; its server outcome is still pending. Source
-invocations can include full branch blocks, so source-transition totals
-must not be reported as exact dataset-step matches.
+cohort in a fresh directory. Recheck on `1071146` passed: **86/86** input
+and original-control matches; **85/85** exact dataset-aligned original
+matches; **26/26** exact-aligned rendered matches, including all **13** new
+cases. Current flat renderability is **13**, V1 parsed targets **19**, and
+**60** rows are explicitly unsupported. One branch-opener row is source-only;
+source-transition totals must not be reported as exact dataset-step matches.
+Text diagnostic remains **85/86**. No replay failures remain in this cohort.
 
 Evaluate native replay and exact grammar coverage before exporting training
 targets or adding a template-aware prediction head. Keep old flat cohort and
 newly covered cases separate; no model/whole-proof improvement is claimed.
+
+## Full prepared-cohort coverage gate
+
+Run the read-only audit after pulling published code:
+
+```sh
+python -B -u -m maths_ai.gnn_inference.scripts.audit_template_coverage \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/sexpr_available_labels_v2 \
+  --cache-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --output-dir maths_ai/gnn_inference/runs/template_v1_coverage
+```
+
+Both full prepared **train and val** cohorts are fixed by the packed
+manifest, including unsupported or invalid-cache rows. No test split is
+read. The grammar is already fixed; the audit selects no new grammar from
+validation results. It needs neither a GPU nor a running Lean backend.
+
+`report.json` checkpoints after each packed chunk. `rows.jsonl` contains
+diagnostics and factorized grammar features, not training targets. Use a
+fresh output directory; partial runs are marked incomplete and can be
+restarted in another directory. This audit does not support resume.
+
+Bindings cover prepared graph dataset/split/row/theorem/tactic metadata,
+the pinned raw extraction version/source commit, normalized/v3 raw-record
+digests and the prepared trace digest when present. These check cached
+provenance, not fresh dataset streaming or native state equivalence. Missing,
+stale or invalid cache/trace rows stay in the denominator and are quarantined
+from both renderer paths. The report records packed/chunk/code/label hashes
+and a digest of per-row records including cache-file hashes.
+
+Inspect each split's `summary` and `by_family`:
+
+- `selected_steps` must equal the full prepared manifest population
+  (expected **218,727 train / 4,157 val** for the accepted artifacts).
+- `legacy_label_supported_steps` counts existing graph labels, distinct
+  from the current conservative `flat_renderable_steps`.
+- `template_v1_parsed_steps` precedes reference rendering; private names
+  can parse but still be unrenderable.
+- `template_mode_renderable_steps` includes V1 rw/simp plus flat fallback
+  for other families. `newly_renderable_vs_flat` and
+  `flat_only_renderable_steps` expose both support gains and losses.
+- `exact_aligned_*` restrict static support to exact source alignment with
+  matching dataset/source targets. Branch-opener support is source-only.
+- `status_counts`, `error_counts`, `template_error_counts`,
+  `flat_error_counts` and `trace_scope_counts` expose exclusions.
+- `parsed_template_features` and
+  `exact_aligned_renderable_template_features` count each family, rule
+  count, local/library source pattern, direction pattern, `only` and
+  location separately. They are not new template class labels.
+
+All coverage counts are static syntax/renderability results. Full-cohort
+Lean execution, model predictions, retrieval reachability, graph-index
+conversion and whole-proof success are not measured. Review the coverage
+and exclusions before designing a separate versioned target export.
+
+Verification: **58 focused tests pass**, including pinned-native regressions
+and coverage checks for stale bindings, unchanged input artifacts, invalid
+traces, unrenderable private targets, source-only/target-mismatched alignment
+and duplicate/incomplete prepared populations. Actual full-cohort server
+coverage remains pending.

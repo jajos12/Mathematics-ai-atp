@@ -155,8 +155,8 @@ The first 20-theorem V1 server replay had **86/86** input matches, **85/86**
 reparsed original transitions and **26/27** rendered matches. All **13/13**
 newly renderable cases passed. The failures were an original multi-line
 fragment reparsed as one tactic and an old-flat derived method reference
-whose receiver was discarded. Fixes are verified on pinned native fixtures;
-the actual Mathlib recheck is pending.
+whose receiver was discarded. Fixes were verified on pinned native fixtures
+and then on the same Mathlib cohort with commit `1071146`.
 
 ```sh
 python -B -u -m maths_ai.gnn_inference.scripts.replay_gold_actions \
@@ -178,3 +178,17 @@ future export. Reclassifying support is not a model accuracy gain.
 Current focused verification: **53 passed**, including actual multi-line
 syntax control versus failed text diagnostic, method-receiver rejection in
 flat/V1 paths, source-only alignment counters and obsolete-control rejection.
+
+The server recheck completed with **86/86** normalized input matches and
+captured-syntax original transitions. Of these, **85/85** are exact dataset
+alignments; one branch-opener row is source-only. Rendered transitions match
+**26/26**, all exact-aligned, including **13/13** newly renderable cases.
+Current flat renderability is **13**, V1 typed parsing **19**; **60** rows
+are explicitly unsupported, with no cache/native/replay failures. Reparsed
+text still matches only **85/86**, confirming why it is diagnostic rather
+than gold control. Report:
+`maths_ai/gnn_inference/runs/native_gold_replay_template_v1_recheck/report.json`.
+
+This clears the small-cohort replay gate. Next measure exact full-prepared
+train/val grammar coverage before target export or template-head training.
+This result measures neither model prediction nor whole-theorem proof success.

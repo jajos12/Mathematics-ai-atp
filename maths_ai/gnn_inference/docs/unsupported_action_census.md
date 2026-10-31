@@ -99,4 +99,35 @@ rerun because the temporary pinned backend was removed; they were skipped
 after correcting the stale environment setting. Census tests cover exact
 accounting with overlapping flags, invalid context references, source-only
 alignment, deterministic examples, unchanged inputs, stale snapshot/report
-rejection and explicit unclassified reasons. Full server census is pending.
+rejection and explicit unclassified reasons.
+
+## Completed server census
+
+Server census on `2fc8650` accounted for all **151,823 train / 2,835 val**
+unsupported-or-invalid rows. Both splits have **zero unclassified** rows,
+but **5,692 train / 135 val** remain in coarse categories requiring finer
+inspection (3.75% / 4.76% of exclusions).
+
+| Exclusive primary area | Train | Share of train exclusions | Val |
+|---|---:|---:|---:|
+| New/scoped bindings | 46,356 | 30.5% | 844 |
+| Unresolved identifier annotations | 32,023 | 21.1% | 596 |
+| Applied expressions + applied rewrite/simp rules | 32,152 | 21.2% | 579 |
+| Reference token/annotation lookup | 6,792 | 4.5% | 132 |
+| V1 rule budget | 6,517 | 4.3% | 122 |
+
+The first three areas total **110,531 train / 2,019 val** exclusions
+(72.8% / 71.2%). Applied expressions and rules individually contribute
+**18,127 + 14,025 train / 333 + 246 val**. These are primary diagnostic
+counts, not guaranteed recoverable targets. Context-reference defects remain
+**831 / 9**. Most coarse cases are other nonreference expressions (**4,211 /
+120**) or other compound rules (**977 / 8**).
+
+Next inspect `by_primary[BLOCKER].by_family`, secondary flags and examples
+for bindings, unresolved identifiers, applied expressions/rules and reference
+lookup. Binding counts alone cannot distinguish cheap introductions from
+cases or intermediate-proof blocks. Unresolved annotations are not all proven
+extractor defects. Applied rule syntax is a promising bounded extension of V1,
+but its actual term forms, reference semantics and exact alignments need
+inspection before locking a new grammar. No further full-cohort scan is
+needed to inspect the already-generated report and examples.

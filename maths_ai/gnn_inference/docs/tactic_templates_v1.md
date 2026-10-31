@@ -183,5 +183,36 @@ and exclusions before designing a separate versioned target export.
 Verification: **58 focused tests pass**, including pinned-native regressions
 and coverage checks for stale bindings, unchanged input artifacts, invalid
 traces, unrenderable private targets, source-only/target-mismatched alignment
-and duplicate/incomplete prepared populations. Actual full-cohort server
-coverage remains pending.
+and duplicate/incomplete prepared populations.
+
+Full-cohort server scan completed on `5335427`:
+
+| Static coverage stage | Train | Val |
+|---|---:|---:|
+| Selected prepared rows | 218,727 | 4,157 |
+| Existing supported labels | 61,853 | 1,207 |
+| Current conservative flat rendering | 43,864 | 862 |
+| V1 parsed targets | 38,325 | 775 |
+| Combined V1 + flat rendering | 66,904 | 1,322 |
+| Newly renderable versus current flat | 23,048 | 460 |
+| Current flat only, lost in V1 mode | 8 | 0 |
+| Exact-aligned combined rendering | 61,836 | 1,317 |
+| Exact-aligned rendered V1 targets | 35,019 | 773 |
+| Unsupported rendering | 150,992 | 2,826 |
+| Invalid context traces | 831 | 9 |
+
+The net change versus existing labels is only **+5,051 train / +115 val**:
+new support also excludes some old labels under stricter checks. Existing
+label support and executable reference rendering are different policies.
+Do not classify every exclusion as an incorrect label without inspection.
+Train alignment includes **12,425 unknown / 1,752 branch openers**; val has
+**27 branch openers**. Invalid trace reason is `unknown_local_reference`.
+
+There are **151,823 train / 2,835 val** unsupported-or-invalid rows. Existing
+scope/flat/template counters overlap and do not form an exclusive failure
+census. Inspect primary blockers, secondary syntax flags and representative
+examples across all tactic families before choosing the next extension.
+These are unsupported formats/data, not measured Lean execution failures.
+
+Next: [exclusive unsupported-action census](unsupported_action_census.md),
+reusing this report to inspect all tactic families before choosing new support.

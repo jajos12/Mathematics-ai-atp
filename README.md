@@ -36,6 +36,10 @@ The `maths_ai.hybrid_reasoner` package implements a proof-search pipeline that u
 ### GNN inference
 The `maths_ai.gnn_inference` package contains the model and inference engine used to predict tactics and relevant premises.
 
+The accepted flat GNN also has a context-preserving native prover and a resumable,
+fixed 244-task miniF2F validation runner. See the [GNN proof-search runbook](maths_ai/gnn_inference/PROOF_SEARCH.md)
+for the pinned model, environment, launch commands, verification, and reporting protocol.
+
 ### PLN inference
 The `maths_ai.pln_inference` package provides symbolic reasoning support for scoring and ranking proof states.
 

@@ -14,6 +14,10 @@ NODE_TYPE_TO_ID = {
     "meta": 5,
 }
 
+# Existing text/legacy models retain their six-type defaults. The published
+# normalized-input model explicitly requests its trained eleven-type mapping.
+MODEL_NODE_TYPE_TO_ID = {**NODE_TYPE_TO_ID, "binder": 6, "const": 7, "sconst": 8, "sbinder": 9, "sapp": 10}
+
 
 def build_vocab_from_labels(labels: Iterable[str], *, unk_token: str = "<UNK>") -> dict[str, int]:
     vocab = {unk_token: 0}
@@ -40,6 +44,7 @@ def dag_to_pyg(
     *,
     add_reverse_edges: bool = False,
     add_self_loops: bool = False,
+    node_type_to_id: dict[str, int] | None = None,
 ):
     """
     Convert a ``DAGBuilder`` to a ``torch_geometric.data.Data`` object.
@@ -51,7 +56,8 @@ def dag_to_pyg(
     from torch_geometric.data import Data
 
     x = torch.tensor([vocab.get(node.label, 0) for node in dag.nodes], dtype=torch.long)
-    node_type = torch.tensor([NODE_TYPE_TO_ID.get(node.node_type, NODE_TYPE_TO_ID["meta"]) for node in dag.nodes], dtype=torch.long)
+    mapping = NODE_TYPE_TO_ID if node_type_to_id is None else node_type_to_id
+    node_type = torch.tensor([mapping.get(node.node_type, mapping["meta"]) for node in dag.nodes], dtype=torch.long)
 
     # Binder features (clamp to non-negative for embedding lookups)
     is_bound = torch.tensor([node.is_bound for node in dag.nodes], dtype=torch.long)
@@ -79,6 +85,20 @@ def dag_to_pyg(
         binder_kind=binder_kind,
         num_nodes=dag.num_nodes,
     )
+
+
+def transform_edge_index(edge_index, *, edge_mode, deduplicate=True):
+    """Apply legacy or accepted trained edge ordering without duplicate code."""
+    import torch
+    if edge_mode == "forward":
+        return edge_index.to(dtype=torch.long).contiguous()
+    if edge_mode != "bidirectional":
+        raise ValueError(f"Unsupported edge mode '{edge_mode}'")
+    forward = edge_index.to(dtype=torch.long)
+    if not forward.numel():
+        return forward.contiguous()
+    combined = torch.cat([forward, forward[[1, 0], :]], dim=1)
+    return torch.unique(combined, dim=1).contiguous() if deduplicate else combined.contiguous()
 
 
 # Node types eligible for pointer-based argument selection

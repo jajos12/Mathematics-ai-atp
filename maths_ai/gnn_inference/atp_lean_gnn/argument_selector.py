@@ -270,6 +270,13 @@ class PublishedGRUPointer(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.max_args = max_args
 
+    def initial_state(self, state_emb: Tensor, tactic_emb: Tensor) -> Tensor:
+        return torch.tanh(self.init_proj(torch.cat([state_emb, tactic_emb], dim=1)))
+
+    def score_candidates(self, decoder_state: Tensor, candidate_embeddings: Tensor) -> Tensor:
+        query = self.out_proj(decoder_state)
+        return (candidate_embeddings @ query.unsqueeze(-1)).squeeze(-1) / math.sqrt(query.size(-1))
+
 
 class PublishedPointerClassifier(nn.Module):
     def __init__(
@@ -408,4 +415,3 @@ def compute_combined_loss(
         "arg_loss": float(arg_loss.item()),
         "total_loss": float(total_loss.item()),
     }
-

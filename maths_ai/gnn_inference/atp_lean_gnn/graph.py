@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .parser import ExprParser
+from .parser import ExprParser, parse_sexp_string
 from .state import ProofState, parse_state
 
 
@@ -100,19 +100,30 @@ class DAGBuilder:
 
     nodes: list[GraphNode] = field(default_factory=list)
     edges: list[tuple[int, int]] = field(default_factory=list)
-    _memo: dict[tuple[str, tuple[int, ...]], int] = field(default_factory=dict)
+    expression_root_id: int | None = None
+    _memo: dict[tuple, int] = field(default_factory=dict)
 
-    def get_or_create(self, label: str, children: tuple[int, ...]) -> int:
-        key = (label, children)
-        if key in self._memo:
+    def add_node(self, label, children, *, node_type=None, is_bound=0, binder_depth=0,
+                 binder_kind=BINDER_KIND_UNKNOWN, hash_cons=True):
+        resolved = node_type or _classify_label(label)
+        key = (label, resolved, children)
+        if hash_cons and key in self._memo:
             return self._memo[key]
 
         node_id = len(self.nodes)
-        self.nodes.append(GraphNode(node_id, label, _classify_label(label), children))
+        self.nodes.append(GraphNode(node_id, label, resolved, children, is_bound, binder_depth, binder_kind))
         for child_id in children:
             self.edges.append((child_id, node_id))
-        self._memo[key] = node_id
+        if hash_cons:
+            self._memo[key] = node_id
         return node_id
+
+    def get_or_create(self, label, children, *, node_type=None):
+        return self.add_node(label, children, node_type=node_type)
+
+    def create_bound_variable(self, label, *, binder_depth, binder_kind):
+        return self.add_node(label, (), node_type="var", is_bound=1, binder_depth=binder_depth,
+                             binder_kind=binder_kind, hash_cons=False)
 
     @property
     def num_nodes(self) -> int:
@@ -284,7 +295,20 @@ def graph_stats(dag: DAGBuilder) -> GraphStats:
     )
 
 
-def proof_state_to_dag(state: str | ProofState) -> DAGBuilder:
+def root_state_node_id(dag):
+    roots = {node.id for node in dag.root_nodes()}
+    candidates = [node.id for node in dag.nodes if node.label == "State" and node.id in roots]
+    if len(candidates) != 1:
+        raise ValueError(f"expected one root State node, found {len(candidates)}")
+    return candidates[0]
+
+
+def proof_state_to_dag(state: str | ProofState, *, goal_sexp=None, hyp_sexps=None) -> DAGBuilder:
+    if goal_sexp is not None or hyp_sexps is not None:
+        if goal_sexp is None or hyp_sexps is None:
+            raise ValueError("normalized goal and all hypotheses must be supplied together")
+        from .model_graph import normalized_state_to_dag
+        return normalized_state_to_dag(goal_sexp, hyp_sexps)
     parsed = state if isinstance(state, ProofState) else parse_state(state)
     dag = DAGBuilder()
     parser = ExprParser(dag)

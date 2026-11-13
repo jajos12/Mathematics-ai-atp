@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 import numpy as np
 import torch
 from torch import Tensor
+
+
+class CandidateSource(str, Enum):
+    LOCAL = "local"
+    LIBRARY = "library"
+
+    @classmethod
+    def parse(cls, value):
+        return cls.LIBRARY if value == "lemma" else cls(value)
 
 
 class LemmaIndexLike(Protocol):

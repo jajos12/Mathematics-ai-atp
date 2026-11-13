@@ -23,7 +23,7 @@ from .argument_selector import TacticWithArgsClassifier, TacticWithArgsConfig
 from .dataset import CANONICAL_SPLITS, canonicalize_split_name
 from .labels import UNKNOWN_TACTIC, get_tactic_arity
 from .model import GraphSAGEClassifierConfig, GraphSAGEStateClassifier
-from .pyg import NODE_TYPE_TO_ID
+from .pyg import NODE_TYPE_TO_ID, transform_edge_index
 from .reporting import console_print
 
 
@@ -406,20 +406,6 @@ def load_prepared_metadata(prepared_root: str | Path) -> PreparedMetadata:
         state_label_id=node_vocab["State"],
         unknown_tactic_id=tactic_vocab[UNKNOWN_TACTIC],
     )
-
-
-def transform_edge_index(edge_index: torch.Tensor, *, edge_mode: str) -> torch.Tensor:
-    if edge_mode == "forward":
-        return edge_index.to(dtype=torch.long).contiguous()
-    if edge_mode != "bidirectional":
-        raise ValueError(f"Unsupported edge mode '{edge_mode}'.")
-    if edge_index.numel() == 0:
-        return edge_index.to(dtype=torch.long).contiguous()
-
-    forward = edge_index.to(dtype=torch.long)
-    reverse = forward[[1, 0], :]
-    combined = torch.cat([forward, reverse], dim=1)
-    return torch.unique(combined, dim=1).contiguous()
 
 
 def validate_prepared_data(data, *, path: Path, split: str, required_fields: tuple[str, ...]) -> None:

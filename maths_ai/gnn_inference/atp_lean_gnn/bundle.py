@@ -44,6 +44,10 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def file_sha256(path):
+    return _sha256(Path(path))
+
+
 def _json_sha256(path: Path) -> str:
     payload = _read_json(path)
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

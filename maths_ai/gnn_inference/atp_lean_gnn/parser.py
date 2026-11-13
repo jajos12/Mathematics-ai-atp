@@ -7,6 +7,35 @@ if TYPE_CHECKING:
     from .graph import DAGBuilder
 
 
+def parse_sexp_string(source):
+    """Parse the accepted Lean AST without importing the PLN runtime."""
+    tokens = re.findall(r"\(|\)|:[^\s()]+|[^\s()]+", source)
+    position = 0
+
+    def read():
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError("Unexpected end of S-expression")
+        token = tokens[position]
+        position += 1
+        if token == "(":
+            result = []
+            while position < len(tokens):
+                if tokens[position] == ")":
+                    position += 1
+                    return result
+                result.append(read())
+            raise ValueError("Unclosed '(' in S-expression")
+        if token == ")":
+            raise ValueError("Unexpected ')' in S-expression")
+        return token
+
+    result = read()
+    if position < len(tokens):
+        raise ValueError(f"Extra tokens after S-expression: {tokens[position:position + 5]}")
+    return result
+
+
 _TOKEN_RE = re.compile(
     r"""
     (?P<LPAREN>  \(                       ) |

@@ -16,6 +16,7 @@ dependencies = [
     "pytest>=9.0.3",
     "regex>=2024.11.6",
     "safetensors>=0.5.3",
+    "transformers>=4.40,<6",
     "torch>=2.12.0",
     "torch-geometric>=2.7.0",
     "uvicorn>=0.30.0",
@@ -37,6 +38,9 @@ pantograph = { git = "https://github.com/stanford-centaur/PyPantograph", rev = "
 where=["."]
 include=["maths_ai", "maths_ai.*"]
 exclude=["data", "experiments", "tests", "tests.*"]
+
+[tool.setuptools.package-data]
+"maths_ai.gnn_inference" = ["lean/*.lean"]
 
 
 [dependency-groups]

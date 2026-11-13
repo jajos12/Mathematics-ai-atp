@@ -1,9 +1,23 @@
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
+from pathlib import Path
 
 from .graph import DAGBuilder
 from .state import ProofState
+
+
+def atomic_json(path, payload):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def payload_sha256(payload):
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def safe_console_text(text: str) -> str:

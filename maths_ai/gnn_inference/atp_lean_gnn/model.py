@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GATv2Conv, SAGEConv
+from torch_geometric.nn import GATv2Conv, SAGEConv, global_add_pool, global_mean_pool
+from torch_geometric.utils import softmax as graph_softmax
 
 from .pyg import NODE_TYPE_TO_ID
 
@@ -118,18 +119,17 @@ class PublishedAttentionReadout(nn.Module):
         state_embeddings = node_embeddings.index_select(0, state_indices)
         batch_index = data.batch.to(node_embeddings.device)
         graph_count = int(state_indices.numel())
-        pooled: list[torch.Tensor] = []
-        for graph_id in range(graph_count):
-            nodes = node_embeddings[batch_index == graph_id]
-            projected = self.node_projection(nodes)
-            weights = torch.softmax(self.attention_score(projected).squeeze(-1), dim=0)
-            pooled.append((weights.unsqueeze(-1) * nodes).sum(dim=0))
-        mean_embeddings = torch.stack(pooled)
+        state_per_node = state_embeddings.index_select(0, batch_index)
+        scores = self.attention_score(torch.tanh(
+            self.node_projection(node_embeddings) + self.state_projection(state_per_node))).squeeze(-1)
+        weights = graph_softmax(scores, batch_index, num_nodes=graph_count)
+        attention_embeddings = global_add_pool(weights.unsqueeze(-1) * node_embeddings, batch_index, size=graph_count)
+        mean_embeddings = global_mean_pool(node_embeddings, batch_index, size=graph_count)
         fused = torch.cat(
-            [self.state_projection(state_embeddings), mean_embeddings, state_embeddings],
+            [state_embeddings, mean_embeddings, attention_embeddings],
             dim=-1,
         )
-        return self.normalization(self.fusion(fused))
+        return F.gelu(self.normalization(self.fusion(fused)))
 
 
 class PublishedGATBackbone(nn.Module):
@@ -173,7 +173,7 @@ class PublishedGATBackbone(nn.Module):
         if self.node_type_embedding is not None:
             x = x + self.node_type_embedding(data.node_type)
         x = x + self.is_bound_embedding(data.is_bound)
-        x = x + self.binder_depth_embedding(data.binder_depth)
+        x = x + self.binder_depth_embedding(data.binder_depth.clamp(0, self.binder_depth_embedding.num_embeddings - 1))
         x = x + self.binder_kind_embedding(data.binder_kind)
         for index, conv in enumerate(self.convs):
             x = F.relu(conv(x, data.edge_index))

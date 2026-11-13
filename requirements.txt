@@ -14,8 +14,9 @@ pygments
 pytest
 PyYAML
 safetensors
-pantograph @ git+https://github.com/stanford-centaur/PyPantograph
+pantograph @ git+https://github.com/stanford-centaur/PyPantograph@3322696b72e81ed50f2f7dc0b667f8278a932283
 torch
 torch-geometric
+transformers>=4.40,<6
 typing-extensions
 typing-inspection

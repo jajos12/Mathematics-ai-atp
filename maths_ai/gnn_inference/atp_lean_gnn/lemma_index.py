@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,11 +26,17 @@ class LemmaIndex:
         lemma_vectors: np.ndarray,
         *,
         normalize_queries: bool = False,
+        lemma_names: list[str] | None = None,
+        manifest: dict | None = None,
     ) -> None:
         self.index = index
         self.lemma_ids = lemma_ids
         self.lemma_vectors = lemma_vectors
         self.normalize_queries = normalize_queries
+        self.lemma_names = lemma_names or []
+        self.manifest = dict(manifest or {})
+        self.id_to_position = {identity: position for position, identity in enumerate(lemma_ids)}
+        self.name_to_id = dict(zip(self.lemma_names, lemma_ids))
 
         if self.lemma_vectors.ndim != 2:
             raise ValueError("lemma_vectors must be 2D (num_lemmas, dim).")
@@ -46,6 +53,7 @@ class LemmaIndex:
         index_dir: str | Path,
         *,
         normalize_queries: bool = False,
+        manifest: dict | None = None,
     ) -> "LemmaIndex":
         import faiss
 
@@ -72,12 +80,21 @@ class LemmaIndex:
         if not isinstance(lemma_ids, list):
             raise ValueError("lemma_ids.json must contain a JSON list of ids.")
 
+        if manifest is None and (index_path.parent / "manifest.json").is_file():
+            manifest = json.loads((index_path.parent / "manifest.json").read_text())
+        if manifest is not None and manifest.get("normalize"):
+            normalize_queries = True
+        names_path = index_path.parent / "lemma_names.json"
+        names = json.loads(names_path.read_text()) if names_path.is_file() else []
+
         index = faiss.read_index(str(index_path))
         return cls(
             index,
             [int(x) for x in lemma_ids],
             lemma_vectors,
             normalize_queries=normalize_queries,
+            lemma_names=names,
+            manifest=manifest,
         )
 
     def search(
@@ -132,3 +149,21 @@ def _normalize_rows(array: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(array, axis=1, keepdims=True)
     norms = np.clip(norms, 1e-12, None)
     return array / norms
+
+
+def state_dict_sha256(state_dict):
+    """Accepted tensor fingerprint, independent of serialization/key order."""
+    import torch
+    digest = hashlib.sha256()
+    for key in sorted(state_dict):
+        tensor = state_dict[key]
+        digest.update(str(key).encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        value = tensor.detach().cpu().contiguous()
+        try:
+            payload = value.numpy().tobytes()
+        except (TypeError, RuntimeError):
+            payload = value.view(torch.int16 if value.element_size() == 2 else torch.uint8).numpy().tobytes()
+        digest.update(payload)
+    return digest.hexdigest()

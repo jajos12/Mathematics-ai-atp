@@ -39,6 +39,8 @@ The `maths_ai.gnn_inference` package contains the model and inference engine use
 The accepted flat GNN also has a context-preserving native prover and a resumable,
 fixed 244-task miniF2F validation runner. See the [GNN proof-search runbook](maths_ai/gnn_inference/PROOF_SEARCH.md)
 for the pinned model, environment, launch commands, verification, and reporting protocol.
+The [mergeability audit](maths_ai/gnn_inference/MERGEABILITY.md) maps current main,
+MCTS-AC, and persistent-atp contracts, verified blockers, and integration order.
 
 ### PLN inference
 The `maths_ai.pln_inference` package provides symbolic reasoning support for scoring and ranking proof states.
